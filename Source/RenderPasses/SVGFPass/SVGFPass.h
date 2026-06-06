@@ -28,6 +28,7 @@
 #pragma once
 #include "Falcor.h"
 #include "RenderGraph/RenderPass.h"
+#include "RenderGraph/RenderPassHelpers.h"
 #include "Core/Pass/FullScreenPass.h"
 
 using namespace Falcor;
@@ -75,6 +76,8 @@ private:
     float mPhiNormal = 128.0f;
     float mAlpha = 0.05f;
     float mMomentsAlpha = 0.2f;
+    RenderPassHelpers::IOSize mOutputSizeSelection = RenderPassHelpers::IOSize::Default;
+    uint2 mFixedOutputSize = {512, 512};
 
     // SVGF passes
     ref<FullScreenPass> mpPackLinearZAndNormal;

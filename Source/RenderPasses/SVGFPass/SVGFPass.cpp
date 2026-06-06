@@ -53,6 +53,8 @@ const char kPhiColor[] = "PhiColor";
 const char kPhiNormal[] = "PhiNormal";
 const char kAlpha[] = "Alpha";
 const char kMomentsAlpha[] = "MomentsAlpha";
+const char kOutputSize[] = "outputSize";
+const char kFixedOutputSize[] = "fixedOutputSize";
 
 // Input buffer names
 const char kInputBufferAlbedo[] = "Albedo";
@@ -98,6 +100,10 @@ SVGFPass::SVGFPass(ref<Device> pDevice, const Properties& props) : RenderPass(pD
             mAlpha = value;
         else if (key == kMomentsAlpha)
             mMomentsAlpha = value;
+        else if (key == kOutputSize)
+            mOutputSizeSelection = value;
+        else if (key == kFixedOutputSize)
+            mFixedOutputSize = value;
         else
             logWarning("Unknown property '{}' in SVGFPass properties.", key);
     }
@@ -121,6 +127,9 @@ Properties SVGFPass::getProperties() const
     props[kPhiNormal] = mPhiNormal;
     props[kAlpha] = mAlpha;
     props[kMomentsAlpha] = mMomentsAlpha;
+    props[kOutputSize] = mOutputSizeSelection;
+    if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed)
+        props[kFixedOutputSize] = mFixedOutputSize;
     return props;
 }
 
@@ -139,6 +148,7 @@ a-trous:
 RenderPassReflection SVGFPass::reflect(const CompileData& compileData)
 {
     RenderPassReflection reflector;
+    const uint2 sz = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
 
     reflector.addInput(kInputBufferAlbedo, "Albedo");
     reflector.addInput(kInputBufferColor, "Color");
@@ -151,22 +161,26 @@ RenderPassReflection SVGFPass::reflect(const CompileData& compileData)
 
     reflector.addInternal(kInternalBufferPreviousLinearZAndNormal, "Previous Linear Z and Packed Normal")
         .format(ResourceFormat::RGBA32Float)
-        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource)
+        .texture2D(sz.x, sz.y);
     reflector.addInternal(kInternalBufferPreviousLighting, "Previous Filtered Lighting")
         .format(ResourceFormat::RGBA32Float)
-        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource)
+        .texture2D(sz.x, sz.y);
     reflector.addInternal(kInternalBufferPreviousMoments, "Previous Moments")
         .format(ResourceFormat::RG32Float)
-        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource);
+        .bindFlags(ResourceBindFlags::RenderTarget | ResourceBindFlags::ShaderResource)
+        .texture2D(sz.x, sz.y);
 
-    reflector.addOutput(kOutputBufferFilteredImage, "Filtered image").format(ResourceFormat::RGBA16Float);
+    reflector.addOutput(kOutputBufferFilteredImage, "Filtered image").format(ResourceFormat::RGBA16Float).texture2D(sz.x, sz.y);
 
     return reflector;
 }
 
 void SVGFPass::compile(RenderContext* pRenderContext, const CompileData& compileData)
 {
-    allocateFbos(compileData.defaultTexDims, pRenderContext);
+    const uint2 sz = RenderPassHelpers::calculateIOSize(mOutputSizeSelection, mFixedOutputSize, compileData.defaultTexDims);
+    allocateFbos(sz, pRenderContext);
     mBuffersNeedClear = true;
 }
 

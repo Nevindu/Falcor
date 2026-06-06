@@ -35,6 +35,7 @@
 #include "Utils/SampleGenerators/HaltonSamplePattern.h"
 #include "Utils/SampleGenerators/StratifiedSamplePattern.h"
 
+#ifndef FALCOR_GBUFFERBASE_NO_REGISTER_PLUGIN
 extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registry)
 {
     registry.registerClass<RenderPass, GBufferRaster>();
@@ -42,6 +43,7 @@ extern "C" FALCOR_API_EXPORT void registerPlugin(Falcor::PluginRegistry& registr
     registry.registerClass<RenderPass, VBufferRaster>();
     registry.registerClass<RenderPass, VBufferRT>();
 }
+#endif
 
 namespace
 {

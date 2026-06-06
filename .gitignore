@@ -31,3 +31,9 @@
 *.tlog
 *.bak
 *.swp
+
+/outputs/
+/.claude/
+/.vscode-default/
+
+/scripts/__pycache__/
