@@ -72,6 +72,20 @@ FALCOR_ENUM_INFO(SpatialMISStrategy, {
 });
 FALCOR_ENUM_REGISTER(SpatialMISStrategy);
 
+enum class ShiftMapping : uint32_t
+{
+    Reconnection = 0,  ///< Fixed-x2 reconnection shift.
+    RandomReplay = 1,  ///< Random replay shift scaffold. Currently falls back to identity.
+    Hybrid       = 2,  ///< Hybrid replay + reconnection shift scaffold. Currently falls back to identity.
+};
+
+FALCOR_ENUM_INFO(ShiftMapping, {
+    { ShiftMapping::Reconnection, "Reconnection" },
+    { ShiftMapping::RandomReplay, "Random replay" },
+    { ShiftMapping::Hybrid, "Hybrid" },
+});
+FALCOR_ENUM_REGISTER(ShiftMapping);
+
 // Define tile sizes in pixels.
 // The frame is divided into tiles stored in scanline order, with pixels in tiles enumerated in Morton order.
 static const uint2 kScreenTileDim = { 16, 16 };     ///< Screen-tile dimension in pixels.
@@ -99,6 +113,8 @@ struct ReSTIRPTParams
     float   specularRoughnessThreshold = 0.25f; ///< Specular reflection events are only classified as specular if the material's roughness value is equal or smaller than this threshold. Otherwise they are classified diffuse.
     float   minReconnectDistance = 1e-3f; ///< Minimum distance for path-space reconnection. Shorter shifts are rejected.
     float   maxReconnectJacobian = 1e4f; ///< Maximum accepted reconnection Jacobian. Larger values are rejected, not clamped.
+    uint    shiftMapping = uint(ShiftMapping::Reconnection); ///< Runtime-selected shift mapping for spatial/future temporal reuse.
+    uint    _padShiftMapping = 0;
 
     // Runtime values
     uint2   frameDim = { 0, 0 };        ///< Frame dimension in pixels.

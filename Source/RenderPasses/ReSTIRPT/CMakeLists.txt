@@ -12,6 +12,10 @@ target_sources(ReSTIRPT PRIVATE
     ReSTIRPT.slang
     ReflectTypes.cs.slang
     ResolvePass.cs.slang
+    ShiftMapping_Hybrid.slang
+    ShiftMapping_RandomReplay.slang
+    ShiftMapping_Reconnection.slang
+    ShiftMappings.slang
     SpatialReuse.cs.slang
     StaticParams.slang
     TracePass.rt.slang

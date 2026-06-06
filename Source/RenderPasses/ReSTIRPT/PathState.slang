@@ -327,6 +327,10 @@ struct PathSample
     uint        reconnectVertex;         ///< Fixed pure-reconnection suffix vertex. Currently 2 for reusable x2 tails, or kInvalidReconnectVertex.
     uint        scatterLobeTags0;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 1..4.
     uint        scatterLobeTags1;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 5..8.
+    uint        techniqueTags0;          ///< Reserved packed per-vertex technique tags for future random replay/hybrid shifts.
+    uint        techniqueTags1;          ///< Reserved packed per-vertex technique tags for future random replay/hybrid shifts.
+    uint        neeTags0;                ///< Reserved packed NEE/light-technique tags for future replay alignment.
+    uint        neeTags1;                ///< Reserved packed NEE/light-technique tags for future replay alignment.
     uint        pathLength;              ///< Terminated path length used for debug and future compatibility checks.
     uint        flags;                   ///< Validity and future shift-mapping flags.
     uint        rngState;                ///< Compact replay seed placeholder for future path replay.
@@ -369,6 +373,17 @@ struct PathReservoir
 };
 
 /** Result of evaluating a selected path sample through a shift mapping.
+
+    Convention used by spatial/future temporal GRIS reuse:
+    - shiftedContribution is the destination-domain estimator contribution for
+      the selected path technique. It may contain technique PDF factors when the
+      original path contribution did.
+    - shiftedTarget is pHat(Y), currently luminance(shiftedContribution).
+    - jacobian is the remaining measure conversion |dT/dX| not already folded
+      into shiftedContribution. A shift implementation must keep this convention
+      self-consistent because reuse weights multiply shiftedTarget * jacobian.
+    - shiftedSample mirrors the accepted destination-domain metadata before the
+      reuse pass localizes primary-surface fields to the destination pixel.
 */
 struct ShiftMappingResult
 {
@@ -378,5 +393,6 @@ struct ShiftMappingResult
     float      targetRatio;               ///< shiftedTarget / originalTarget.
     float      jacobian;                  ///< Shift mapping Jacobian.
     float3     shiftedContribution;        ///< Contribution after shift evaluation.
+    PathSample shiftedSample;              ///< Sample metadata after the shift, before destination-domain localization.
     uint       rejectionReason;           ///< 0 = accepted, nonzero = rejected.
 };

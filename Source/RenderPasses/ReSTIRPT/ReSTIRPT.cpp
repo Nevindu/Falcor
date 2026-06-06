@@ -111,6 +111,7 @@ namespace
     const std::string kSpatialRadius = "spatialRadius";
     const std::string kSpatialIterations = "spatialIterations";
     const std::string kSpatialMISStrategy = "spatialMISStrategy";
+    const std::string kShiftMapping = "shiftMapping";
 
     const Gui::DropdownList kDebugViewList =
     {
@@ -131,6 +132,13 @@ namespace
         { 14u, "Spatial rejection reason" },
         { 15u, "Spatial shift mask" },
         { 16u, "Replay mismatch mask" },
+    };
+
+    const Gui::DropdownList kShiftMappingList =
+    {
+        { uint32_t(ShiftMapping::Reconnection), "Reconnection" },
+        { uint32_t(ShiftMapping::RandomReplay), "Random replay" },
+        { uint32_t(ShiftMapping::Hybrid), "Hybrid" },
     };
 }
 
@@ -235,6 +243,7 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kSpatialRadius) mSpatialRadius = value;
         else if (key == kSpatialIterations) mSpatialIterations = value;
         else if (key == kSpatialMISStrategy) mSpatialMISStrategy = value;
+        else if (key == kShiftMapping) mParams.shiftMapping = value;
 
         else logWarning("Unknown property '{}' in ReSTIRPT properties.", key);
     }
@@ -316,6 +325,7 @@ void ReSTIRPT::validateOptions()
     mSpatialNeighborCount = std::clamp(mSpatialNeighborCount, 0u, 32u);
     mSpatialRadius = std::clamp(mSpatialRadius, 1u, 128u);
     mSpatialIterations = std::clamp(mSpatialIterations, 1u, 1u);
+    mParams.shiftMapping = std::min<uint32_t>(mParams.shiftMapping, uint32_t(ShiftMapping::Hybrid));
 }
 
 Properties ReSTIRPT::getProperties() const
@@ -368,6 +378,7 @@ Properties ReSTIRPT::getProperties() const
     props[kSpatialRadius] = mSpatialRadius;
     props[kSpatialIterations] = mSpatialIterations;
     props[kSpatialMISStrategy] = mSpatialMISStrategy;
+    props[kShiftMapping] = mParams.shiftMapping;
 
     return props;
 }
@@ -579,6 +590,7 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
             runtimeDirty |= group.var("Radius", mSpatialRadius, 1u, 128u);
             runtimeDirty |= group.var("Iterations", mSpatialIterations, 1u, 1u);
             runtimeDirty |= group.dropdown("Spatial MIS", mSpatialMISStrategy);
+            runtimeDirty |= group.dropdown("Shift mapping", kShiftMappingList, mParams.shiftMapping);
         }
     }
 

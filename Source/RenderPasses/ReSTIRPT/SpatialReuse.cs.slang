@@ -5,25 +5,18 @@
 import Params;
 import PathState;
 import LoadShadingData;
-import Scene.RaytracingInline;
-import Rendering.Lights.EmissiveLightSamplerInterface;
-import Rendering.Lights.EmissiveLightSamplerHelpers;
-import Rendering.Lights.LightHelpers;
-import Rendering.Materials.TexLODHelpers;
 import Utils.Math.MathHelpers;
-import Utils.Sampling.TinyUniformSampleGenerator;
 import ReSTIRPT;
+import ShiftMappings;
 
 ParameterBlock<ReSTIRPT> gReSTIRPT;
 
 /** Spatial reuse for ReSTIR PT.
 
     The current pixel's reservoir is the defensive/canonical identity candidate.
-    Neighbor reservoirs are shifted with a conservative path-space reconnection:
-    direct import is limited to BSDF terminal samples at vertex 2, while deeper
-    selected NEE/terminal events replay the source path and reconnect the
-    destination primary hit to the source x2 tail. Direct primary NEE import is
-    intentionally disabled here to avoid falling back to ReSTIR DI behavior.
+    Neighbor reservoirs are evaluated through the runtime-selected shift mapping.
+    This pass owns only reservoir/MIS plumbing; the mapping-specific path-space
+    evaluation lives on ReSTIRPT.applyShiftMapping().
 */
 struct SpatialReusePass
 {
@@ -41,17 +34,10 @@ struct SpatialReusePass
     uint misStrategy;
 
     static const bool kUseViewDir = USE_VIEW_DIR;
-    static const bool kUseAlphaTest = USE_ALPHA_TEST;
     static const uint kMaxSpatialCandidates = 33u;
     static const uint kSpatialMISConstant = 0u;
     static const uint kSpatialMISGeneralized = 1u;
     static const uint kSpatialMISPairwise = 2u;
-    static const uint kReusableLightEnvMap = 0u;
-    static const uint kReusableLightEmissive = 1u;
-    static const uint kReusableLightAnalytic = 2u;
-    static const uint kReusableLightFlagUseMIS = 1u << 0;
-    static const uint kReusableLightFlagSampleUpper = 1u << 1;
-    static const uint kReusableLightFlagSampleLower = 1u << 2;
 
     /** Small deterministic integer hash used for neighbor sampling.
 
@@ -77,75 +63,11 @@ struct SpatialReusePass
         return float(state & 0x00ffffffu) / float(0x01000000u);
     }
 
-    /** Luminance proxy used for scalar reservoir targets in this pass.
-    */
-    float localLuminance(float3 c)
-    {
-        return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
-    }
-
     /** Convert a pixel coordinate to the flattened reservoir-buffer index.
     */
     uint reservoirIndex(uint2 pixel)
     {
         return pixel.y * params.frameDim.x + pixel.x;
-    }
-
-    /** Reconstruct the source pass's light-type selection probability.
-
-        Stored light PDFs already include light-type selection, so shifted
-        evaluation must use the same enabled-light normalization.
-    */
-    float getLightTypeSelectionProbability(uint lightType)
-    {
-        float p0 = 0.f;
-        float p1 = 0.f;
-        float p2 = 0.f;
-#if USE_ENV_LIGHT
-        p0 = 1.f;
-#endif
-#if USE_EMISSIVE_LIGHTS
-        p1 = 1.f;
-#endif
-#if USE_ANALYTIC_LIGHTS
-        p2 = 1.f;
-#endif
-        const float sum = p0 + p1 + p2;
-        if (sum <= 0.f) return 0.f;
-
-        if (lightType == kReusableLightEnvMap) return p0 / sum;
-        if (lightType == kReusableLightEmissive) return p1 / sum;
-        if (lightType == kReusableLightAnalytic) return p2 / sum;
-        return 0.f;
-    }
-
-    /** Evaluate the same two-technique MIS heuristic used by the trace pass.
-    */
-    float evalMIS(float n0, float p0, float n1, float p1)
-    {
-        switch (MISHeuristic(kMISHeuristic))
-        {
-        case MISHeuristic::Balance:
-        {
-            float q0 = n0 * p0;
-            float q1 = n1 * p1;
-            return q0 / (q0 + q1);
-        }
-        case MISHeuristic::PowerTwo:
-        {
-            float q0 = (n0 * p0) * (n0 * p0);
-            float q1 = (n1 * p1) * (n1 * p1);
-            return q0 / (q0 + q1);
-        }
-        case MISHeuristic::PowerExp:
-        {
-            float q0 = pow(n0 * p0, kMISPowerExponent);
-            float q1 = pow(n1 * p1, kMISPowerExponent);
-            return q0 / (q0 + q1);
-        }
-        default:
-            return 0.f;
-        }
     }
 
     /** Conservative validity test for a stored reservoir.
@@ -160,27 +82,6 @@ struct SpatialReusePass
     uint getProposalConfidence(PathReservoir reservoir)
     {
         return isValid(reservoir) ? max(1u, reservoir.M) : 0u;
-    }
-
-    /** True for BSDF lobes whose support survives changing the incident edge.
-    */
-    bool isNonDeltaReflectionLobe(uint lobeType)
-    {
-        return (lobeType & (uint)LobeType::NonDeltaReflection) != 0u && (lobeType & (uint)LobeType::Transmission) == 0u;
-    }
-
-    /** Check whether a destination material can realize a replayed source lobe.
-    */
-    bool canRealizeReplayLobe(uint availableLobes, uint lobeType)
-    {
-        return lobeType != 0u && (availableLobes & lobeType) == lobeType;
-    }
-
-    /** Fetch the stored sampled lobe at a source path vertex.
-    */
-    uint getSampleReplayLobeTag(PathSample sample, uint vertex)
-    {
-        return getReplayLobeTag(sample.scatterLobeTags0, sample.scatterLobeTags1, vertex);
     }
 
     /** Load destination visible surface data from the V-buffer.
@@ -227,221 +128,6 @@ struct SpatialReusePass
         return 0u;
     }
 
-    /** Geometry-only Jacobian for direct terminal-at-x2 reconnection.
-
-        Finite emissive hits change the solid-angle/area conversion at the
-        terminal light point. Environment/directional samples use unit geometry
-        Jacobian because there is no finite light-point area measure.
-    */
-    float computeTerminalReconnectGeometryJacobian(PathSample sample, ShadingData dstSd)
-    {
-        if (sample.reusableLightDistance >= kRayTMax) return 1.f;
-        if (dot(sample.reusableLightNormalW, sample.reusableLightNormalW) <= 0.25f) return 1.f;
-
-        const float3 oldEdge = sample.reusableLightPosW - sample.primaryPosW;
-        const float3 newEdge = sample.reusableLightPosW - dstSd.posW;
-        const float oldDistSqr = dot(oldEdge, oldEdge);
-        const float newDistSqr = dot(newEdge, newEdge);
-        const float minDistSqr = params.minReconnectDistance * params.minReconnectDistance;
-        if (oldDistSqr <= minDistSqr || newDistSqr <= minDistSqr) return 0.f;
-
-        const float3 lightNormal = normalize(sample.reusableLightNormalW);
-        const float oldCos = abs(dot(lightNormal, -oldEdge * rsqrt(oldDistSqr)));
-        const float newCos = abs(dot(lightNormal, -newEdge * rsqrt(newDistSqr)));
-        if (oldCos <= kMinCosTheta || newCos <= kMinCosTheta) return 0.f;
-
-        const float jacobian = (newCos / oldCos) * (oldDistSqr / newDistSqr);
-        return !isnan(jacobian) && !isinf(jacobian) && jacobian > 0.f && jacobian <= params.maxReconnectJacobian ? jacobian : 0.f;
-    }
-
-    /** Recover terminal light geometry for a BSDF-sampled event at source x2.
-
-        This handles only fixed-x2 terminal samples: directly hit emissive
-        geometry or the environment after the source primary bounce.
-    */
-    bool evaluateTerminalBSDFGeometry(PathSample sample, ShadingData dstSd, out float3 origin, out float3 dir, out float distance, out float3 emission, out float lightPdf, out float geometryJacobian, out uint rejectionReason)
-    {
-        origin = dstSd.computeRayOrigin();
-        dir = float3(0.f, 1.f, 0.f);
-        distance = 0.f;
-        emission = float3(0.f);
-        lightPdf = 0.f;
-        geometryJacobian = 1.f;
-        rejectionReason = 0u;
-
-        if ((sample.flags & kPathSampleFlagCanReconnectAtX2) == 0u || sample.reusableLightValid == 0u || sample.selectedVertex != 2u)
-        {
-            rejectionReason = 8u;
-            return false;
-        }
-
-        if (sample.selectedKind == kPathSampleKindEnv)
-        {
-#if USE_ENV_LIGHT
-            dir = normalize(sample.reusableLightDir);
-            origin = dstSd.computeRayOrigin();
-            distance = kRayTMax;
-            emission = sample.reusableLightLi;
-
-            const float selectionPdf = getLightTypeSelectionProbability(kReusableLightEnvMap);
-            lightPdf = selectionPdf > 0.f ? selectionPdf * gReSTIRPT.envMapSampler.evalPdf(dir) : 0.f;
-            return any(emission > 0.f);
-#else
-            rejectionReason = 8u;
-            return false;
-#endif
-        }
-
-        if (sample.selectedKind == kPathSampleKindHitLight)
-        {
-#if USE_EMISSIVE_LIGHTS
-            const float3 toLightPoint = sample.reusableLightPosW - dstSd.posW;
-            const float distSqr = dot(toLightPoint, toLightPoint);
-            if (distSqr <= 1e-8f)
-            {
-                rejectionReason = 9u;
-                return false;
-            }
-
-            distance = sqrt(distSqr);
-            dir = toLightPoint / distance;
-            origin = dstSd.computeRayOrigin();
-            if (dot(sample.reusableLightNormalW, -dir) <= 0.f)
-            {
-                rejectionReason = 9u;
-                return false;
-            }
-
-            TriangleLightHit hit;
-            hit.triangleIndex = sample.reusableLightTriangleIndex;
-            hit.posW = sample.reusableLightPosW;
-            hit.normalW = sample.reusableLightNormalW;
-            const bool sampleUpperHemisphere = (sample.reusableLightFlags & kReusableLightFlagSampleUpper) != 0u;
-            const bool sampleLowerHemisphere = (sample.reusableLightFlags & kReusableLightFlagSampleLower) != 0u;
-            const bool upperHemisphere = sampleUpperHemisphere && !sampleLowerHemisphere;
-
-            const float selectionPdf = getLightTypeSelectionProbability(kReusableLightEmissive);
-            lightPdf = selectionPdf > 0.f ? selectionPdf * gReSTIRPT.emissiveSampler.evalPdf(dstSd.posW, dstSd.getOrientedFaceNormal(), upperHemisphere, hit) : 0.f;
-            geometryJacobian = computeTerminalReconnectGeometryJacobian(sample, dstSd);
-            if (geometryJacobian <= 0.f)
-            {
-                rejectionReason = 13u;
-                return false;
-            }
-
-            emission = sample.reusableLightLi;
-            return any(emission > 0.f);
-#else
-            rejectionReason = 8u;
-            return false;
-#endif
-        }
-
-        rejectionReason = 8u;
-        return false;
-    }
-
-    /** Evaluate a non-replayed terminal candidate after replacing x1 by y1.
-
-        The source sample stores the terminal light event and source BSDF PDF.
-        This recomputes the destination BSDF/PDF/visibility and returns the
-        shifted contribution, target, and pure-reconnection Jacobian.
-    */
-    bool evaluateTerminalBSDFCandidate(
-        PathReservoir candidate,
-        ShadingData dstSd,
-        HitInfo dstHit,
-        uint2 pixel,
-        out PathReservoir shifted,
-        out float shiftedTarget,
-        out uint rejectionReason)
-    {
-        shifted = candidate;
-        shiftedTarget = 0.f;
-        rejectionReason = 0u;
-
-        float3 origin;
-        float3 dir;
-        float distance;
-        float3 emission;
-        float lightPdf;
-        float geometryJacobian;
-        if (!evaluateTerminalBSDFGeometry(candidate.sample, dstSd, origin, dir, distance, emission, lightPdf, geometryJacobian, rejectionReason))
-            return false;
-
-        const float sourceScatterPdf = candidate.sample.reusableScatterPdf;
-        if (sourceScatterPdf <= 0.f)
-        {
-            rejectionReason = 13u;
-            return false;
-        }
-
-        let lod = ExplicitLodTextureSampler(0.f);
-        let hints = getMaterialInstanceHints(dstHit, true);
-        const IMaterialInstance mi = gScene.materials.getMaterialInstance(dstSd, lod, hints);
-        TinyUniformSampleGenerator sg = TinyUniformSampleGenerator(pixel, params.frameCount);
-        BSDFProperties dstBsdfProperties = mi.getProperties(dstSd);
-
-        const uint sourceLobe = getSampleReplayLobeTag(candidate.sample, 1u);
-        if (dstBsdfProperties.roughness <= params.specularRoughnessThreshold ||
-            !isNonDeltaReflectionLobe(sourceLobe) ||
-            !canRealizeReplayLobe(mi.getLobeTypes(dstSd), sourceLobe))
-        {
-            rejectionReason = 14u;
-            return false;
-        }
-
-        const float dstScatterPdf = mi.evalPdf(dstSd, dir, kUseBSDFSampling);
-        if (dstScatterPdf <= 0.f)
-        {
-            rejectionReason = 13u;
-            return false;
-        }
-
-        float3 bsdfWeight = mi.eval(dstSd, dir, sg) / dstScatterPdf;
-        if ((candidate.sample.reusableLightFlags & kReusableLightFlagUseMIS) != 0u)
-        {
-            if (lightPdf <= 0.f)
-            {
-                rejectionReason = 9u;
-                return false;
-            }
-            bsdfWeight *= evalMIS(1.f, dstScatterPdf, 1.f, lightPdf);
-        }
-
-        const float3 shiftedContribution = bsdfWeight * emission;
-        shiftedTarget = max(0.f, localLuminance(shiftedContribution));
-        if (shiftedTarget <= 0.f)
-        {
-            rejectionReason = 10u;
-            return false;
-        }
-
-        SceneRayQuery<kUseAlphaTest> rayQuery;
-        const Ray ray = Ray(origin, dir, 0.f, distance);
-        if (!rayQuery.traceVisibilityRay(ray))
-        {
-            rejectionReason = 11u;
-            return false;
-        }
-
-        shifted.sample.contribution = shiftedContribution;
-        shifted.sample.reusableScatterPdf = dstScatterPdf;
-        shifted.sample.reusableLightPdf = lightPdf;
-        shifted.sample.reusableLightDistance = distance;
-        shifted.target = shiftedTarget;
-        shifted.shiftedTarget = shiftedTarget;
-        shifted.targetRatio = candidate.target > 0.f ? shiftedTarget / candidate.target : 0.f;
-        shifted.jacobian = geometryJacobian * dstScatterPdf / sourceScatterPdf;
-        if (shifted.jacobian <= 0.f || isnan(shifted.jacobian) || isinf(shifted.jacobian) || shifted.jacobian > params.maxReconnectJacobian)
-        {
-            rejectionReason = 13u;
-            return false;
-        }
-        shifted.rejectionReason = 0u;
-        return true;
-    }
-
     /** Validate the current pixel's canonical sample under the identity map.
     */
     bool evaluateIdentityCandidate(PathReservoir candidate, out PathReservoir shifted, out uint rejectionReason)
@@ -477,69 +163,55 @@ struct SpatialReusePass
         shifted.sample.flags |= kPathSampleFlagAlreadyShifted;
     }
 
-    /** Evaluate a stored NEE light sample at the destination surface.
+    /** Convert a shift-mapping result into reservoir state for this proposal.
 
-        This handles the reusable selected events generated by ReSTIRPT: NEE light
-        samples, BSDF-sampled emissive hits, and BSDF-sampled environment hits.
-        Unsupported path-tree candidates are rejected here.
-
-        Rejection reasons:
-        8 unsupported reusable sample
-        9 invalid light geometry or destination light PDF
-        10 destination BSDF evaluates to zero
-        11 visibility ray blocked
-        12 selected event requires source path replay/tail evaluation
-        13 invalid reconnection Jacobian
-        15 replay self-consistency/RNG mismatch, or an already-shifted replay sample
+        The shift implementation owns contribution/target/Jacobian evaluation.
+        Spatial reuse only installs the result and localizes metadata so a
+        selected neighbor reservoir becomes self-consistent in the destination
+        primary domain.
     */
-    bool evaluateReconnectedCandidate(
-        PathReservoir candidate,
+    bool materializeShiftMappingResult(
+        PathReservoir sourceCandidate,
+        ShiftMappingResult shift,
         ShadingData dstSd,
-        HitInfo dstHit,
-        uint2 pixel,
+        float dstDepth,
+        uint dstMaterialID,
         out PathReservoir shifted,
         out float shiftedTarget,
         out uint rejectionReason)
     {
-        shifted = candidate;
+        shifted = sourceCandidate;
         shiftedTarget = 0.f;
-        rejectionReason = 0u;
+        rejectionReason = shift.rejectionReason;
 
-        if ((candidate.sample.flags & kPathSampleFlagNeedsReplay) != 0u)
+        if (!shift.valid) return false;
+        if (shift.shiftedTarget <= 0.f || shift.jacobian <= 0.f || isnan(shift.shiftedTarget) || isinf(shift.shiftedTarget) || isnan(shift.jacobian) || isinf(shift.jacobian))
         {
-            if ((candidate.sample.flags & kPathSampleFlagAlreadyShifted) != 0u)
-            {
-                rejectionReason = 15u;
-                return false;
-            }
-
-            ShiftMappingResult replay = gReSTIRPT.evaluateReplayReconnection(candidate, dstSd, dstHit, pixel);
-            rejectionReason = replay.rejectionReason;
-            if (!replay.valid) return false;
-
-            shifted.sample.contribution = replay.shiftedContribution;
-            shifted.target = replay.shiftedTarget;
-            shifted.shiftedTarget = replay.shiftedTarget;
-            shifted.targetRatio = replay.targetRatio;
-            shifted.jacobian = replay.jacobian;
-            shifted.rejectionReason = 0u;
-            shiftedTarget = replay.shiftedTarget;
-            return true;
+            rejectionReason = 13u;
+            return false;
         }
 
-        if (candidate.sample.selectedKind == kPathSampleKindHitLight || candidate.sample.selectedKind == kPathSampleKindEnv)
-        {
-            return evaluateTerminalBSDFCandidate(candidate, dstSd, dstHit, pixel, shifted, shiftedTarget, rejectionReason);
-        }
+        shifted.sample = shift.shiftedSample;
+        shifted.sample.contribution = shift.shiftedContribution;
+        shifted.target = shift.shiftedTarget;
+        shifted.shiftedTarget = shift.shiftedTarget;
+        shifted.targetRatio = shift.targetRatio;
+        shifted.jacobian = shift.jacobian;
+        shifted.rejectionReason = 0u;
+        shiftedTarget = shift.shiftedTarget;
 
-        rejectionReason = 8u;
-        return false;
+        localizeShiftedSampleMetadata(shifted, dstSd, dstDepth, dstMaterialID, shiftedTarget);
+        return true;
     }
 
     /** GRIS reservoir update weight for an already shifted candidate.
 
-        Constant mode preserves the baseline merge form. Generalized/pairwise
-        modes fold their MIS weight into the shifted p-hat * W * M * |J| term.
+        Constant mode uses the source reservoir confidence M_i directly.
+
+        Generalized/pairwise modes receive a normalized domain MIS weight m_i(y)
+        that already includes proposal confidence terms. Because finalizeReservoir()
+        divides by the total confidence sum, the update uses totalM * m_i(y).
+        When all proposal domains are identical, totalM * m_i(y) reduces to M_i.
     */
     float getReservoirCandidateWeight(PathReservoir reservoir, float misWeight = 1.f, uint totalCandidateCount = 0u)
     {
@@ -551,10 +223,10 @@ struct SpatialReusePass
         return reservoir.shiftedTarget * reservoir.W * float(max(1u, totalCandidateCount)) * reservoir.jacobian * misWeight;
     }
 
-    /** Evaluate a source-domain candidate in another proposal domain.
+    /** Evaluate a source candidate in another proposal domain for MIS terms.
 
-        Used by MIS denominator terms. It returns a transient shifted reservoir
-        and deliberately does not localize/store destination metadata.
+        This uses the same selected shift mapping as the accepted-candidate path,
+        so generalized/pairwise denominators see the same proposal support.
     */
     bool evaluateCandidateAtPixel(PathReservoir sourceCandidate, uint2 sourcePixel, uint2 evalPixel, out PathReservoir shifted, out uint rejectionReason)
     {
@@ -581,14 +253,16 @@ struct SpatialReusePass
         rejectionReason = getCompatibilityRejection(sourceCandidate, evalPosW, evalNormalW, evalDepth, evalMaterialID);
         if (rejectionReason != 0u) return false;
 
+        ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, evalSd, evalHit, evalPixel);
         float shiftedTarget = 0.f;
-        return evaluateReconnectedCandidate(sourceCandidate, evalSd, evalHit, evalPixel, shifted, shiftedTarget, rejectionReason);
+        return materializeShiftMappingResult(sourceCandidate, shift, evalSd, evalDepth, evalMaterialID, shifted, shiftedTarget, rejectionReason);
     }
 
     /** Generalized balance-heuristic weight over all spatial proposal domains.
 
         Densities are compared in the current pixel domain by mapping the source
         candidate into each proposal pixel and accounting for the Jacobian ratio.
+        The returned value is m_i(y), not an extra M multiplier.
     */
     float getGeneralizedMISWeight(PathReservoir sourceCandidate, PathReservoir shiftedToCenter, uint2 sourcePixel, uint sourceM, uint proposalCount, uint2 proposalPixels[kMaxSpatialCandidates], PathReservoir proposalReservoirs[kMaxSpatialCandidates])
     {
@@ -626,7 +300,9 @@ struct SpatialReusePass
 
         The canonical branch averages pairwise canonical weights over neighbors;
         non-canonical branches return their pair contribution divided by the
-        number of pairs, not the total proposal count.
+        number of pairs, not the total proposal count. As with generalized MIS,
+        the returned value is m_i(y); getReservoirCandidateWeight() supplies the
+        final totalM factor.
     */
     float getPairwiseMISWeight(PathReservoir sourceCandidate, PathReservoir shiftedToCenter, uint2 sourcePixel, uint sourceM, uint proposalCount, uint2 proposalPixels[kMaxSpatialCandidates], PathReservoir proposalReservoirs[kMaxSpatialCandidates])
     {
@@ -719,9 +395,9 @@ struct SpatialReusePass
 
     /** Combine the current pixel reservoir with randomly sampled neighbor reservoirs.
 
-        This is a strict connection-shift combine. The local reservoir and every
-        imported neighbor reservoir are first reconnected/evaluated at the
-        destination pixel. Rejected candidates do not contribute to the output.
+        The local reservoir is the canonical self proposal. Neighbor reservoirs
+        are evaluated at the destination pixel by the selected shift mapping.
+        Rejected candidates do not contribute to the output.
     */
     void execute(uint2 pixel)
     {
@@ -832,14 +508,14 @@ struct SpatialReusePass
             uint shiftRejectionReason = 0u;
             PathReservoir shiftedCandidate;
             float shiftedTarget = 0.f;
-            if (!evaluateReconnectedCandidate(sourceCandidate, dstSd, dstHit, pixel, shiftedCandidate, shiftedTarget, shiftRejectionReason))
+            ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, dstSd, dstHit, pixel);
+            if (!materializeShiftMappingResult(sourceCandidate, shift, dstSd, dstDepth, dstMaterialID, shiftedCandidate, shiftedTarget, shiftRejectionReason))
             {
                 lastRejectionReason = shiftRejectionReason;
                 rejected++;
                 continue;
             }
 
-            localizeShiftedSampleMetadata(shiftedCandidate, dstSd, dstDepth, dstMaterialID, shiftedTarget);
             shiftedCandidates[proposalIndex] = shiftedCandidate;
             proposalAccepted[proposalIndex] = 1u;
             accepted++;
