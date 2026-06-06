@@ -33,9 +33,11 @@ import Rendering.Materials.IsotropicGGX;
 import Rendering.Materials.InteriorListHelpers;
 import Rendering.Volumes.HomogeneousVolumeSampler;
 import Rendering.Utils.PixelStats;
+import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Geometry.GeometryHelpers;
 import Utils.Debug.PixelDebug;
+import Utils.Sampling.TinyUniformSampleGenerator;
 import LoadShadingData;
 import ColorType;
 __exported import PathState;
@@ -89,6 +91,7 @@ struct ReSTIRPT
     static const bool kUseAnalyticLights = USE_ANALYTIC_LIGHTS;
     static const bool kUseCurves = USE_CURVES;
     static const bool kUseHairMaterial = USE_HAIR_MATERIAL;
+    static const bool kUseAlphaTest = USE_ALPHA_TEST;
 
     // Additional specialization.
     static const bool kOutputGuideData = OUTPUT_GUIDE_DATA;
@@ -96,23 +99,33 @@ struct ReSTIRPT
 
     /** Types of samplable lights.
     */
-    enum class LightType
+    enum class SampledLightType
     {
         EnvMap,
         Emissive,
         Analytic
     };
 
+    static const uint kReusableLightFlagUseMIS = 1u << 0;
+    static const uint kReusableLightFlagSampleUpper = 1u << 1;
+    static const uint kReusableLightFlagSampleLower = 1u << 2;
+
     /** Describes a light sample.
     */
     struct LightSample
     {
         float3  Li;         ///< Incident radiance at the shading point (unshadowed). This is already divided by the pdf.
+        float3  Le;         ///< Light radiance before solid-angle PDF division, used for shifted reconnection.
         float   pdf;        ///< Pdf with respect to solid angle at the shading point.
         float3  origin;     ///< Ray origin for visibility evaluation (offseted to avoid self-intersection).
         float   distance;   ///< Ray distance for visibility evaluation (shortened to avoid self-intersection).
         float3  dir;        ///< Ray direction for visibility evaluation (normalized).
-        uint    lightType;  ///< Light type this sample comes from (LightType casted to uint).
+        float3  normal;     ///< Light normal for finite emissive samples.
+        float   scatterPdf; ///< BSDF PDF for the sampled light direction, used by MIS.
+        uint    lightType;  ///< Sampled light class this sample comes from (SampledLightType casted to uint).
+        uint    lightIndex; ///< Analytic light index when lightType is Analytic.
+        uint    triangleIndex; ///< Emissive triangle index when lightType is Emissive.
+        uint    flags;      ///< Reusable-light metadata flags.
 
         Ray getVisibilityRay() { return Ray(origin, dir, 0.f, distance); }
     };
@@ -264,12 +277,14 @@ struct ReSTIRPT
         \param[in] pathID Path ID which encodes pixel and sample index.
         \param[out] path Path state for the primary hit.
     */
-    void generatePath(const uint pathID, out PathState path)
+    void generatePath(const uint pathID, const uint pathSeed, out PathState path)
     {
         path = {};
         path.setActive();
         path.id = pathID;
+        path.pathSeed = pathSeed;
         path.thp = float3(1.f);
+        path.reconnectVertex = kInvalidReconnectVertex;
 
         const uint2 pixel = path.getPixel();
 
@@ -280,8 +295,9 @@ struct ReSTIRPT
         path.dir = cameraRay.dir;
 
         // Create sample generator.
-        const uint maxSpp = kSamplesPerPixel > 0 ? kSamplesPerPixel : kMaxSamplesPerPixel;
-        path.sg = SampleGenerator(pixel, params.seed * maxSpp + path.getSampleIdx());
+        path.sg = SampleGenerator(pixel, path.pathSeed);
+        path.risState = hashPathState(path.pathSeed ^ 0xa511e9b3u);
+        path.selectedKind = kPathSampleKindInvalid;
 
         // Load the primary hit info from the V-buffer.
         const HitInfo hit = unpackHitInfo(vbuffer[pixel]);
@@ -292,6 +308,11 @@ struct ReSTIRPT
             path.setHit(hit);
             path.setVertexIndex(1);
         }
+    }
+
+    void generatePath(const uint pathID, out PathState path)
+    {
+        generatePath(pathID, makePathSeed(pathID, params.seed), path);
     }
 
     /** Set up path for logging and debugging.
@@ -359,23 +380,229 @@ struct ReSTIRPT
         path.thp *= weight;
     }
 
-    /** Add a path-tree candidate to the initial RIS reservoir.
-        \param[in,out] path Path state.
-        \param[in] radiance Vertex radiance.
+    /** True for BSDF lobes compatible with changing the incident reconnection edge.
     */
-    void addToPathContribution(inout PathState path, const float3 radiance)
+    bool isNonDeltaReflectionLobe(uint lobeType)
+    {
+        return (lobeType & (uint)LobeType::NonDeltaReflection) != 0u && (lobeType & (uint)LobeType::Transmission) == 0u;
+    }
+
+    /** Check whether a material's active lobes contain the stored replay lobe.
+    */
+    bool canRealizeReplayLobe(uint availableLobes, uint lobeType)
+    {
+        return lobeType != 0u && (availableLobes & lobeType) == lobeType;
+    }
+
+    /** Fetch a sampled lobe tag from the live path state for replay metadata.
+    */
+    uint getPathReplayLobeTag(const PathState path, uint vertex)
+    {
+        return getReplayLobeTag(path.scatterLobeTags0, path.scatterLobeTags1, vertex);
+    }
+
+    /** Fetch a sampled lobe tag from a compact reusable path sample.
+    */
+    uint getSampleReplayLobeTag(const PathSample sample, uint vertex)
+    {
+        return getReplayLobeTag(sample.scatterLobeTags0, sample.scatterLobeTags1, vertex);
+    }
+
+    /** Store the sampled scatter lobe at the current vertex for later replay.
+    */
+    void recordReplayScatterLobe(inout PathState path, uint lobeType)
+    {
+        setReplayLobeTag(path.scatterLobeTags0, path.scatterLobeTags1, path.getVertexIndex(), lobeType);
+    }
+
+    /** Conservative support test for the reused x2 vertex.
+
+        Fixed-x2 pure reconnection changes the incoming direction at x2, so this
+        rejects surfaces/volumes/lobes where that mapped direction has no support.
+    */
+    bool isFixedX2ReconnectibleSurface(
+        const PathState path,
+        const BSDFProperties bsdfProperties,
+        const uint lobeTypes,
+        const bool isTriangleHit,
+        const bool isCurveHit)
+    {
+        if (path.getVertexIndex() != 2u) return false;
+        if (!isTriangleHit || isCurveHit) return false;
+        if (!path.interiorList.isEmpty() || path.isInsideDielectricVolume()) return false;
+        if (float(path.sceneLength) < params.minReconnectDistance) return false;
+        if (bsdfProperties.roughness <= params.specularRoughnessThreshold) return false;
+        return (lobeTypes & (uint)LobeType::NonDeltaReflection) != 0u;
+    }
+
+    /** Mark the path reusable only when the current vertex is the supported x2.
+    */
+    void updateFixedX2ReconnectVertex(
+        inout PathState path,
+        const BSDFProperties bsdfProperties,
+        const uint lobeTypes,
+        const bool isTriangleHit,
+        const bool isCurveHit)
+    {
+        if (path.reconnectVertex != kInvalidReconnectVertex) return;
+        if (path.getVertexIndex() != 2u) return;
+        if (isFixedX2ReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit))
+            path.reconnectVertex = 2u;
+    }
+
+    void addPathContributionCandidate(
+        inout PathState path,
+        const float3 radiance,
+        const uint sampleKind,
+        const bool reusableLightValid,
+        const uint reusableLightType,
+        const uint reusableLightIndex,
+        const uint reusableLightTriangleIndex,
+        const float3 reusableLightPosW,
+        const float3 reusableLightNormalW,
+        const float3 reusableLightLe,
+        const float3 reusableLightDir,
+        const float reusableLightDistance,
+        const float reusableLightPdf,
+        const float reusableScatterPdf,
+        const uint reusableLightFlags)
     {
         const float3 contribution = path.thp * radiance;
         const float target = max(0.f, luminance(contribution));
         if (target <= 0.f) return;
 
+        const uint candidateIndex = path.risCandidateCount;
+        path.risCandidateCount++;
+
         const float newWeightSum = path.risWeightSum + target;
-        if (sampleNext1D(path.sg) * newWeightSum < target)
+        if (sampleNextRIS(path.risState) * newWeightSum < target)
         {
             path.L = contribution;
             path.risTarget = target;
+            path.selectedCandidate = candidateIndex;
+            path.selectedKind = sampleKind;
+            path.selectedVertex = path.getVertexIndex();
+            path.reusableLightValid = reusableLightValid ? 1u : 0u;
+            path.reusableLightType = reusableLightType;
+            path.reusableLightIndex = reusableLightIndex;
+            path.reusableLightTriangleIndex = reusableLightTriangleIndex;
+            path.reusableLightPosW = reusableLightPosW;
+            path.reusableLightNormalW = reusableLightNormalW;
+            path.reusableLightLi = reusableLightLe;
+            path.reusableLightDir = reusableLightDir;
+            path.reusableLightDistance = reusableLightDistance;
+            path.reusableLightPdf = reusableLightPdf;
+            path.reusableScatterPdf = reusableScatterPdf;
+            path.reusableLightFlags = reusableLightFlags;
         }
         path.risWeightSum = newWeightSum;
+    }
+
+    /** Add a generic path-tree candidate to the initial RIS reservoir.
+        \param[in,out] path Path state.
+        \param[in] radiance Vertex radiance.
+    */
+    void addToPathContribution(inout PathState path, const float3 radiance)
+    {
+        addPathContributionCandidate(path, radiance, kPathSampleKindHitLight, false, 0u, 0u, 0u, float3(0.f), float3(0.f), float3(0.f), float3(0.f), 0.f, 0.f, 0.f, 0u);
+    }
+
+    /** Add a BSDF-sampled emissive hit candidate with enough endpoint data for spatial shifts.
+    */
+    void addHitLightPathContribution(
+        inout PathState path,
+        const float3 radiance,
+        const float3 emission,
+        const ShadingData sd,
+        const uint triangleIndex,
+        const float lightPdf,
+        const float scatterPdf,
+        const uint flags)
+    {
+        const bool reusable = path.getVertexIndex() > 1u && triangleIndex != 0xffffffffu && scatterPdf > 0.f;
+        addPathContributionCandidate(
+            path,
+            radiance,
+            kPathSampleKindHitLight,
+            reusable,
+            uint(SampledLightType::Emissive),
+            0u,
+            triangleIndex,
+            sd.posW,
+            sd.getOrientedFaceNormal(),
+            emission,
+            path.dir,
+            distance(sd.posW, path.origin),
+            lightPdf,
+            scatterPdf,
+            flags);
+    }
+
+    /** Add an environment miss candidate to the initial RIS reservoir.
+        \param[in,out] path Path state.
+        \param[in] radiance Environment radiance.
+    */
+    void addEnvPathContribution(inout PathState path, const float3 radiance, const float3 Le, const float lightPdf, const float scatterPdf, const uint flags)
+    {
+        const bool reusable = path.getVertexIndex() > 1u && scatterPdf > 0.f;
+        addPathContributionCandidate(
+            path,
+            radiance,
+            kPathSampleKindEnv,
+            reusable,
+            uint(SampledLightType::EnvMap),
+            0u,
+            0u,
+            float3(0.f),
+            -path.dir,
+            Le,
+            path.dir,
+            kRayTMax,
+            lightPdf,
+            scatterPdf,
+            flags);
+    }
+
+    /** Add an NEE direct-light candidate that may be spatially reconnected later.
+
+        All NEE light samples carry enough geometry for the spatial pass to
+        reconnect the same light sample at a neighboring destination surface.
+    */
+    void addNEEPathContribution(inout PathState path, const float3 radiance, const LightSample ls)
+    {
+        const bool finite = ls.distance < kRayTMax;
+        const float3 lightPosW = finite ? ls.origin + ls.dir * ls.distance : float3(0.f);
+        addPathContributionCandidate(path, radiance, kPathSampleKindNEE, true, ls.lightType, ls.lightIndex, ls.triangleIndex, lightPosW, ls.normal, ls.Le, ls.dir, ls.distance, ls.pdf, ls.scatterPdf, ls.flags);
+    }
+
+    /** Load compact primary-surface data for the pixel that generated a sample.
+
+        Spatial reuse keeps this primary data for diagnostics and future temporal
+        shifts. Current spatial correctness is decided by the shift map rather than
+        by a material/normal/depth heuristic filter.
+    */
+    bool loadPrimarySurfaceData(const uint2 pixel, out float3 posW, out float3 normalW, out float depth, out uint materialID)
+    {
+        posW = float3(0.f);
+        normalW = float3(0.f, 1.f, 0.f);
+        depth = 0.f;
+        materialID = 0u;
+
+        const HitInfo hit = unpackHitInfo(vbuffer[pixel]);
+        if (!hit.isValid()) return false;
+
+        Ray cameraRay = gScene.camera.computeRayPinhole(pixel, params.frameDim);
+        if (kUseViewDir) cameraRay.dir = -viewDir[pixel];
+
+        ShadingData sd = loadShadingData(hit, cameraRay.origin, cameraRay.dir);
+        uint loadedMaterialID = 0u;
+        loadVertexData(hit, cameraRay.origin, cameraRay.dir, loadedMaterialID);
+
+        posW = sd.posW;
+        normalW = normalize(sd.faceN);
+        depth = distance(cameraRay.origin, sd.posW);
+        materialID = loadedMaterialID;
+        return true;
     }
 
     /** Extract the selected RIS candidate from live path state into a reusable sample.
@@ -388,12 +615,73 @@ struct ReSTIRPT
     {
         PathSample sample = {};
         sample.pathID = path.id;
-        sample.selectedCandidate = path.getSampleIdx();
+        sample.pathSeed = path.pathSeed;
+        sample.selectedCandidate = path.selectedCandidate;
+        sample.risCandidateCount = path.risCandidateCount;
+        sample.selectedKind = path.selectedKind;
+        sample.selectedVertex = path.selectedVertex;
+        sample.reconnectVertex = path.reconnectVertex;
+        sample.scatterLobeTags0 = path.scatterLobeTags0;
+        sample.scatterLobeTags1 = path.scatterLobeTags1;
         sample.pathLength = getTerminatedPathLength(path);
-        sample.flags = path.risTarget > 0.f ? 1u : 0u;
-        sample.rngState = params.seed;
+        sample.flags = path.risTarget > 0.f ? kPathSampleFlagValid : 0u;
+        const uint primaryScatterLobe = getPathReplayLobeTag(path, 1u);
+        const bool primaryScatterReconnectible = path.isDiffusePrimaryHit() && isNonDeltaReflectionLobe(primaryScatterLobe);
+        if (path.reusableLightValid != 0u && path.selectedVertex == 2u && primaryScatterReconnectible && (path.selectedKind == kPathSampleKindHitLight || path.selectedKind == kPathSampleKindEnv))
+        {
+            sample.flags |= kPathSampleFlagCanReconnectAtX2;
+        }
+        const bool hasSupportedTailReconnect = path.reconnectVertex == 2u && primaryScatterReconnectible;
+        if (hasSupportedTailReconnect &&
+            ((path.selectedKind == kPathSampleKindNEE && path.selectedVertex > 1u) ||
+             ((path.selectedKind == kPathSampleKindHitLight || path.selectedKind == kPathSampleKindEnv) && path.selectedVertex > 2u)))
+        {
+            sample.flags |= kPathSampleFlagNeedsReplay;
+        }
+        sample.rngState = path.pathSeed;
         sample.target = path.risTarget;
         sample.contribution = path.L;
+        sample.reusableLightValid = path.reusableLightValid;
+        sample.reusableLightType = path.reusableLightType;
+        sample.reusableLightIndex = path.reusableLightIndex;
+        sample.reusableLightTriangleIndex = path.reusableLightTriangleIndex;
+        sample.reusableLightPosW = path.reusableLightPosW;
+        sample.reusableLightNormalW = path.reusableLightNormalW;
+        sample.reusableLightLi = path.reusableLightLi;
+        sample.reusableLightDir = path.reusableLightDir;
+        sample.reusableLightDistance = path.reusableLightDistance;
+        sample.reusableLightPdf = path.reusableLightPdf;
+        sample.reusableScatterPdf = path.reusableScatterPdf;
+        sample.reusableLightFlags = path.reusableLightFlags;
+
+        float3 primaryPosW;
+        float3 primaryNormalW;
+        float primaryDepth;
+        uint primaryMaterialID;
+        if (loadPrimarySurfaceData(path.getPixel(), primaryPosW, primaryNormalW, primaryDepth, primaryMaterialID))
+        {
+            sample.primaryPosW = primaryPosW;
+            sample.primaryNormalW = primaryNormalW;
+            sample.primaryDepth = primaryDepth;
+            sample.primaryMaterialID = primaryMaterialID;
+        }
+        else
+        {
+            // Directly visible environment samples have no primary surface, but
+            // remain valid for the canonical identity domain. They simply cannot
+            // be imported into surface pixels by the x2 reconnection shift.
+            if (sample.selectedKind == kPathSampleKindEnv && sample.selectedVertex <= 1u)
+            {
+                sample.primaryPosW = float3(0.f);
+                sample.primaryNormalW = float3(0.f, 1.f, 0.f);
+                sample.primaryDepth = 0.f;
+                sample.primaryMaterialID = 0xffffffffu;
+            }
+            else
+            {
+                sample.flags = 0u;
+            }
+        }
         return sample;
     }
 
@@ -408,12 +696,41 @@ struct ReSTIRPT
         reservoir.sample = makePathSample(path);
         reservoir.wSum = path.risWeightSum;
         reservoir.target = path.risTarget;
-        reservoir.M = kSamplesPerPixel;
-        reservoir.W = path.risTarget > 0.f && kSamplesPerPixel > 0 ? path.risWeightSum / (path.risTarget * float(kSamplesPerPixel)) : 0.f;
+        reservoir.M = path.risTarget > 0.f ? 1u : 0u;
+        reservoir.W = path.risTarget > 0.f ? path.risWeightSum / path.risTarget : 0.f;
         reservoir.shiftedTarget = path.risTarget;
         reservoir.targetRatio = path.risTarget > 0.f ? 1.f : 0.f;
         reservoir.jacobian = 1.f;
         reservoir.rejectionReason = path.risTarget > 0.f ? 0u : 1u;
+        return reservoir;
+    }
+
+    bool isReservoirValid(const PathReservoir reservoir)
+    {
+        return (reservoir.sample.flags & kPathSampleFlagValid) != 0u && reservoir.target > 0.f && reservoir.sample.target > 0.f && reservoir.wSum > 0.f;
+    }
+
+    float getInitialReservoirCandidateWeight(const PathReservoir reservoir)
+    {
+        return isReservoirValid(reservoir) ? reservoir.wSum : 0.f;
+    }
+
+    PathReservoir finalizeInitialReservoir(PathReservoir reservoir, const float weightSum, const uint candidateCount)
+    {
+        if (!isReservoirValid(reservoir) || weightSum <= 0.f || candidateCount == 0u)
+        {
+            PathReservoir empty = {};
+            empty.rejectionReason = 1u;
+            return empty;
+        }
+
+        reservoir.wSum = weightSum;
+        reservoir.M = candidateCount;
+        reservoir.shiftedTarget = reservoir.target;
+        reservoir.targetRatio = 1.f;
+        reservoir.jacobian = 1.f;
+        reservoir.W = reservoir.target > 0.f ? weightSum / (reservoir.target * float(candidateCount)) : 0.f;
+        reservoir.rejectionReason = 0u;
         return reservoir;
     }
 
@@ -430,7 +747,7 @@ struct ReSTIRPT
         result.originalTarget = reservoir.target;
         result.jacobian = 1.f;
 
-        if (reservoir.sample.flags == 0u)
+        if ((reservoir.sample.flags & kPathSampleFlagValid) == 0u)
         {
             result.rejectionReason = 1u;
             return result;
@@ -472,6 +789,8 @@ struct ReSTIRPT
         {
             shifted.sample.flags = 0u;
             shifted.target = 0.f;
+            shifted.wSum = 0.f;
+            shifted.M = 0u;
             shifted.W = 0.f;
             return shifted;
         }
@@ -485,13 +804,13 @@ struct ReSTIRPT
 
     /** Convert a reservoir back to a color contribution for beauty output.
 
-        For the current initial-RIS estimator W = wSum / (target * M), so multiplying
-        by M reconstructs the previous wSum / target weighting used before the
-        reservoir was made explicit.
+        W is the reservoir contribution weight. Spatial resampling may still use
+        W * M as the source proposal compensation, but final shading evaluates the
+        selected shifted contribution once with W.
     */
     float3 evaluateReservoirContribution(const PathReservoir reservoir)
     {
-        return (reservoir.sample.flags != 0u && reservoir.target > 0.f) ? reservoir.sample.contribution * reservoir.W * float(reservoir.M) : float3(0.f);
+        return ((reservoir.sample.flags & kPathSampleFlagValid) != 0u && reservoir.target > 0.f) ? reservoir.sample.contribution * reservoir.W : float3(0.f);
     }
 
     /** Debug/beauty visualization for the selected reservoir.
@@ -507,8 +826,8 @@ struct ReSTIRPT
         case 1: return reservoir.target.xxx * 0.02f;
         case 2: return reservoir.W.xxx;
         case 3: return float(reservoir.sample.pathLength).xxx / 10.f;
-        case 4: return reservoir.sample.flags != 0u ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
-        case 5: return float(reservoir.sample.selectedCandidate).xxx / max(1.f, float(kSamplesPerPixel - 1u));
+        case 4: return (reservoir.sample.flags & kPathSampleFlagValid) != 0u ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
+        case 5: return float(reservoir.sample.selectedCandidate).xxx / max(1.f, float(max(1u, reservoir.sample.risCandidateCount) - 1u));
         case 6: return reservoir.shiftedTarget.xxx * 0.02f;
         case 7: return reservoir.targetRatio.xxx;
         case 8: return reservoir.rejectionReason == 0u ? float3(0.f, 1.f, 0.f) : float3(1.f, 0.f, 0.f);
@@ -547,6 +866,7 @@ struct ReSTIRPT
         const bool isCurvePolyTubeHit = isTriangleHit && isHairMaterial;
 
         path.dir = bs.wo;
+        recordReplayScatterLobe(path, bs.lobeType);
         updatePathThroughput(path, bs.weight);
         path.pdf = bs.pdf;
 
@@ -562,11 +882,13 @@ struct ReSTIRPT
             if (isDiffuse)
             {
                 path.incrementBounces(BounceType::Diffuse);
+                if (path.getVertexIndex() == 1u) path.setDiffusePrimaryHit();
             }
             else
             {
                 path.incrementBounces(BounceType::Specular);
                 path.setSpecular();
+                if (path.getVertexIndex() == 1u) path.setSpecularPrimaryHit();
             }
         }
 
@@ -574,6 +896,7 @@ struct ReSTIRPT
         if (bs.isLobe(LobeType::Delta))
         {
             path.setDelta();
+            if (path.getVertexIndex() == 1u && bs.isLobe(LobeType::Reflection)) path.setDeltaReflectionPrimaryHit();
         }
 
         // Handle transmission events.
@@ -671,10 +994,12 @@ struct ReSTIRPT
 
         // Setup returned sample.
         ls.Li = lightSample.pdf > 0.f ? lightSample.Le / lightSample.pdf : float3(0);
+        ls.Le = lightSample.Le;
         ls.pdf = lightSample.pdf;
         ls.origin = vertex.getRayOrigin(lightSample.dir);
         ls.distance = kRayTMax;
         ls.dir = lightSample.dir;
+        ls.normal = -lightSample.dir;
 
         return any(ls.Li > 0.f);
     }
@@ -696,6 +1021,7 @@ struct ReSTIRPT
 
         // Setup returned sample.
         ls.Li = tls.pdf > 0.f ? tls.Le / tls.pdf : float3(0);
+        ls.Le = tls.Le;
         ls.pdf = tls.pdf;
         // Offset shading and light position to avoid self-intersection.
         float3 lightPos = computeRayOrigin(tls.posW, tls.normalW);
@@ -703,6 +1029,8 @@ struct ReSTIRPT
         float3 toLight = lightPos - ls.origin;
         ls.distance = length(toLight);
         ls.dir = normalize(toLight);
+        ls.normal = tls.normalW;
+        ls.triangleIndex = tls.triangleIndex;
 
         return any(ls.Li > 0.f);
     }
@@ -723,20 +1051,28 @@ struct ReSTIRPT
         // Sample analytic light source selected uniformly from the light list.
         // TODO: Sample based on estimated contributions as pdf.
         uint lightIndex = min(uint(sampleNext1D(sg) * lightCount), lightCount - 1);
+        const LightData light = gScene.getLight(lightIndex);
 
         // Sample local light source.
         AnalyticLightSample lightSample;
-        if (!sampleLight(vertex.pos, gScene.getLight(lightIndex), sg, lightSample)) return false;
+        if (!sampleLight(vertex.pos, light, sg, lightSample)) return false;
 
         // Setup returned sample.
         ls.pdf = lightSample.pdf / lightCount;
         ls.Li = lightSample.Li * lightCount;
+        ls.Le = light.intensity;
         // Offset shading position to avoid self-intersection.
         ls.origin = vertex.getRayOrigin(lightSample.dir);
         // Analytic lights do not currently have a geometric representation in the scene.
         // Do not worry about adjusting the ray length to avoid self-intersections at the light.
         ls.distance = lightSample.distance;
         ls.dir = lightSample.dir;
+        ls.normal = lightSample.normalW;
+        ls.lightIndex = lightIndex;
+        if (light.type == LightType::Point || light.type == LightType::Rect || light.type == LightType::Disc || light.type == LightType::Sphere)
+        {
+            ls.origin = vertex.getRayOrigin(lightSample.posW - vertex.pos);
+        }
 
         return any(ls.Li > 0.f);
     }
@@ -815,14 +1151,14 @@ struct ReSTIRPT
         if (!selectLightType(lightType, selectionPdf, sg)) return false;
 
         bool valid = false;
-        if (kUseEnvLight && lightType == (uint)LightType::EnvMap) valid = generateEnvMapSample(vertex, sg, ls);
-        if (kUseEmissiveLights && lightType == (uint)LightType::Emissive)
+        if (kUseEnvLight && lightType == (uint)SampledLightType::EnvMap) valid = generateEnvMapSample(vertex, sg, ls);
+        if (kUseEmissiveLights && lightType == (uint)SampledLightType::Emissive)
         {
             // Emissive light samplers have an option to exclusively sample the upper hemisphere.
             bool upperHemisphere = sampleUpperHemisphere && !sampleLowerHemisphere;
             valid = generateEmissiveSample(vertex, upperHemisphere, sg, ls);
         }
-        if (kUseAnalyticLights && lightType == (uint)LightType::Analytic)
+        if (kUseAnalyticLights && lightType == (uint)SampledLightType::Analytic)
         {
             valid = generateAnalyticLightSample(vertex, sg, ls);
         }
@@ -837,8 +1173,685 @@ struct ReSTIRPT
         ls.lightType = lightType;
         ls.pdf *= selectionPdf;
         ls.Li /= selectionPdf;
+        ls.flags = select(sampleUpperHemisphere, kReusableLightFlagSampleUpper, 0u) |
+                   select(sampleLowerHemisphere, kReusableLightFlagSampleLower, 0u);
 
         return true;
+    }
+
+    /** Trace the next replay ray and advance the replay vertex index.
+
+        Replay needs to reproduce the source suffix exactly; this helper mirrors
+        normal path traversal while keeping the compact replay loop readable.
+    */
+    bool traceReplayNextHit(inout PathState path, out float hitT)
+    {
+        path.incrementVertexIndex();
+        SceneRayQuery<kUseAlphaTest> sceneRayQuery;
+        const HitInfo hit = sceneRayQuery.traceRay(path.getScatterRay(), hitT);
+        path.clearHit();
+        if (!hit.isValid()) return false;
+
+        path.setHit(hit);
+        path.sceneLength += float16_t(hitT);
+        return true;
+    }
+
+    /** Per-channel ratio that safely zeros channels with invalid source values.
+    */
+    float3 safeColorRatio(float3 numerator, float3 denominator)
+    {
+        const float eps = 1e-6f;
+        return float3(
+            denominator.x > eps ? numerator.x / denominator.x : 0.f,
+            denominator.y > eps ? numerator.y / denominator.y : 0.f,
+            denominator.z > eps ? numerator.z / denominator.z : 0.f);
+    }
+
+    /** Area-measure Jacobian for the fixed-x2 pure reconnection edge.
+    */
+    float computeVertexReconnectJacobian(float3 srcPrimaryPosW, float3 dstPrimaryPosW, float3 reconnectPosW, float3 reconnectNormalW)
+    {
+        // Fixed-x2 pure reconnection changes only the edge into the reused x2
+        // vertex. The finite-vertex area-measure Jacobian is
+        // (cos_new / |y1-x2|^2) / (cos_old / |x1-x2|^2).
+        const float3 oldEdge = reconnectPosW - srcPrimaryPosW;
+        const float3 newEdge = reconnectPosW - dstPrimaryPosW;
+        const float oldDistSqr = dot(oldEdge, oldEdge);
+        const float newDistSqr = dot(newEdge, newEdge);
+        const float minDistSqr = params.minReconnectDistance * params.minReconnectDistance;
+        if (oldDistSqr <= minDistSqr || newDistSqr <= minDistSqr) return 0.f;
+
+        const float3 n = normalize(reconnectNormalW);
+        const float oldCos = abs(dot(n, -oldEdge * rsqrt(oldDistSqr)));
+        const float newCos = abs(dot(n, -newEdge * rsqrt(newDistSqr)));
+        if (oldCos <= kMinCosTheta || newCos <= kMinCosTheta) return 0.f;
+
+        const float jacobian = (newCos / oldCos) * (oldDistSqr / newDistSqr);
+        return !isnan(jacobian) && !isinf(jacobian) && jacobian > 0.f && jacobian <= params.maxReconnectJacobian ? jacobian : 0.f;
+    }
+
+    /** Re-evaluate the stored NEE light sample at an arbitrary replay vertex.
+
+        Used both for the source replay vertex and the shifted destination
+        version of that vertex, preserving the original light-type PDF convention.
+    */
+    bool evaluateStoredLightGeometryAtVertex(PathSample sample, ShadingData sd, out float3 origin, out float3 dir, out float distance, out float3 lightFactor, out float lightPdf, out uint rejectionReason)
+    {
+        origin = sd.computeRayOrigin();
+        dir = float3(0.f, 1.f, 0.f);
+        distance = 0.f;
+        lightFactor = float3(0.f);
+        lightPdf = 0.f;
+        rejectionReason = 0u;
+
+        if (sample.reusableLightValid == 0u)
+        {
+            rejectionReason = 8u;
+            return false;
+        }
+
+        if (sample.reusableLightType == uint(SampledLightType::EnvMap))
+        {
+#if USE_ENV_LIGHT
+            const float selectionPdf = getEnvMapSelectionProbability();
+            if (selectionPdf <= 0.f)
+            {
+                rejectionReason = 8u;
+                return false;
+            }
+
+            dir = normalize(sample.reusableLightDir);
+            lightPdf = selectionPdf * envMapSampler.evalPdf(dir);
+            if (lightPdf <= 0.f)
+            {
+                rejectionReason = 9u;
+                return false;
+            }
+
+            origin = sd.computeRayOrigin();
+            distance = kRayTMax;
+            lightFactor = sample.reusableLightLi / lightPdf;
+            return any(lightFactor > 0.f);
+#else
+            rejectionReason = 8u;
+            return false;
+#endif
+        }
+
+        if (sample.reusableLightType == uint(SampledLightType::Emissive))
+        {
+#if USE_EMISSIVE_LIGHTS
+            const float selectionPdf = getEmissiveSelectionProbability();
+            if (selectionPdf <= 0.f)
+            {
+                rejectionReason = 8u;
+                return false;
+            }
+
+            TriangleLightHit hit;
+            hit.triangleIndex = sample.reusableLightTriangleIndex;
+            hit.posW = sample.reusableLightPosW;
+            hit.normalW = sample.reusableLightNormalW;
+
+            const bool sampleUpperHemisphere = (sample.reusableLightFlags & kReusableLightFlagSampleUpper) != 0u;
+            const bool sampleLowerHemisphere = (sample.reusableLightFlags & kReusableLightFlagSampleLower) != 0u;
+            const bool upperHemisphere = sampleUpperHemisphere && !sampleLowerHemisphere;
+            lightPdf = selectionPdf * emissiveSampler.evalPdf(sd.posW, sd.getOrientedFaceNormal(), upperHemisphere, hit);
+            if (lightPdf <= 0.f)
+            {
+                rejectionReason = 9u;
+                return false;
+            }
+
+            const float3 toLightPoint = sample.reusableLightPosW - sd.posW;
+            const float distSqr = dot(toLightPoint, toLightPoint);
+            if (distSqr <= 1e-8f || dot(sample.reusableLightNormalW, -normalize(toLightPoint)) <= 0.f)
+            {
+                rejectionReason = 9u;
+                return false;
+            }
+
+            distance = sqrt(distSqr);
+            dir = toLightPoint / distance;
+            origin = sd.computeRayOrigin();
+            lightFactor = sample.reusableLightLi / lightPdf;
+            return any(lightFactor > 0.f);
+#else
+            rejectionReason = 8u;
+            return false;
+#endif
+        }
+
+        if (sample.reusableLightType == uint(SampledLightType::Analytic))
+        {
+#if USE_ANALYTIC_LIGHTS
+            const float selectionPdf = getAnalyicSelectionProbability();
+            const uint lightCount = gScene.getLightCount();
+            if (selectionPdf <= 0.f || sample.reusableLightIndex >= lightCount || lightCount == 0u)
+            {
+                rejectionReason = 8u;
+                return false;
+            }
+
+            const LightData light = gScene.getLight(sample.reusableLightIndex);
+            lightPdf = selectionPdf / float(lightCount);
+            if (lightPdf <= 0.f)
+            {
+                rejectionReason = 9u;
+                return false;
+            }
+
+            if (light.type == LightType::Directional || light.type == LightType::Distant)
+            {
+                dir = normalize(sample.reusableLightDir);
+                origin = sd.computeRayOrigin();
+                distance = kRayTMax;
+                lightFactor = light.intensity / lightPdf;
+                return any(lightFactor > 0.f);
+            }
+
+            const float3 toLightPoint = sample.reusableLightPosW - sd.posW;
+            const float distSqr = max(dot(toLightPoint, toLightPoint), kMinLightDistSqr);
+            distance = sqrt(distSqr);
+            dir = toLightPoint / distance;
+            origin = sd.computeRayOrigin();
+
+            if (light.type == LightType::Point)
+            {
+                const float cosTheta = -dot(dir, light.dirW);
+                float falloff = 1.f;
+                if (cosTheta < light.cosOpeningAngle) falloff = 0.f;
+                else if (light.penumbraAngle > 0.f)
+                {
+                    const float deltaAngle = light.openingAngle - acos(cosTheta);
+                    falloff = smoothstep(0.f, light.penumbraAngle, deltaAngle);
+                }
+                lightFactor = light.intensity * falloff / distSqr / lightPdf;
+                return any(lightFactor > 0.f);
+            }
+
+            if (light.type == LightType::Rect || light.type == LightType::Sphere || light.type == LightType::Disc)
+            {
+                const float cosLight = dot(sample.reusableLightNormalW, -dir);
+                if (cosLight <= 0.f)
+                {
+                    rejectionReason = 9u;
+                    return false;
+                }
+                lightFactor = light.intensity * (light.surfaceArea * cosLight / distSqr) / lightPdf;
+                return any(lightFactor > 0.f);
+            }
+#endif
+        }
+
+        rejectionReason = 8u;
+        return false;
+    }
+
+    /** Evaluate the selected stored NEE contribution at a replayed surface.
+
+        The returned value is the local light-sampling contribution before the
+        path-prefix ratios are applied by evaluateReplayReconnection().
+    */
+    bool evaluateStoredNEEAtVertex(PathSample sample, ShadingData sd, HitInfo hit, uint2 evalPixel, out float3 contribution, out uint rejectionReason)
+    {
+        contribution = float3(0.f);
+        rejectionReason = 0u;
+
+        float3 origin;
+        float3 dir;
+        float distance;
+        float3 lightFactor;
+        float lightPdf;
+        if (!evaluateStoredLightGeometryAtVertex(sample, sd, origin, dir, distance, lightFactor, lightPdf, rejectionReason))
+            return false;
+
+        let lod = ExplicitLodTextureSampler(0.f);
+        let hints = getMaterialInstanceHints(hit, false);
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, lod, hints);
+        TinyUniformSampleGenerator sg = TinyUniformSampleGenerator(evalPixel, params.frameCount);
+
+        if ((sample.reusableLightFlags & kReusableLightFlagUseMIS) != 0u)
+        {
+            const float scatterPdf = mi.evalPdf(sd, dir, kUseBSDFSampling);
+            lightFactor *= evalMIS(1.f, lightPdf, 1.f, scatterPdf);
+        }
+
+        contribution = mi.eval(sd, dir, sg) * lightFactor;
+        if (!any(contribution > 0.f))
+        {
+            rejectionReason = 10u;
+            return false;
+        }
+        return true;
+    }
+
+    /** Consume NEE-side random choices during replay without adding candidates.
+
+        This keeps the replay RNG stream aligned with the original trace, even
+        though visibility and RIS selection are not recomputed while replaying.
+    */
+    bool consumeReplayNEE(ShadingData sd, const IMaterialInstance mi, uint lobeTypes, bool isCurveHit, bool isCurvePolyTubeHit, inout PathState path)
+    {
+        const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
+        const bool applyNEE = kUseNEE && hasNonDeltaLobes;
+
+        path.setLightSampled(false, false);
+        if (!applyNEE) return true;
+
+        LightSample ls = {};
+        PathVertex vertex = PathVertex(path.getVertexIndex(), sd.posW, sd.faceN, sd.frontFacing);
+
+        const bool canNeeSampleSphere = isCurveHit || isCurvePolyTubeHit;
+        bool sampleUpperHemisphere = canNeeSampleSphere || ((lobeTypes & (uint)LobeType::NonDeltaReflection) != 0);
+        bool sampleLowerHemisphere = canNeeSampleSphere || ((lobeTypes & (uint)LobeType::NonDeltaTransmission) != 0);
+        if (!kUseLightsInDielectricVolumes && path.isInsideDielectricVolume()) sampleUpperHemisphere = false;
+
+        bool validSample = generateLightSample(vertex, sampleUpperHemisphere, sampleLowerHemisphere, path.sg, ls);
+        path.setLightSampled(sampleUpperHemisphere, sampleLowerHemisphere);
+        if (!validSample) return true;
+
+        if (kUseMIS && ls.lightType != (uint)SampledLightType::Analytic)
+        {
+            float scatterPdf = mi.evalPdf(sd, ls.dir, kUseBSDFSampling);
+            ls.Li *= evalMIS(1, ls.pdf, 1, scatterPdf);
+        }
+
+        // Match the original path RNG stream. Visibility does not affect later RNG.
+        mi.eval(sd, ls.dir, path.sg);
+        return true;
+    }
+
+    /** Replay a source suffix and evaluate the fixed-x2 reconnection shift.
+
+        This is the deeper-event path for Y=(y0,y1,x2,...). It rebuilds the
+        source path from pathID/pathSeed, verifies replayed lobe consistency,
+        reconnects y1 to x2, and returns the shifted p-hat, contribution, and
+        Jacobian used by spatial GRIS.
+    */
+    ShiftMappingResult evaluateReplayReconnection(PathReservoir candidate, ShadingData dstSd, HitInfo dstHit, uint2 dstPixel)
+    {
+        ShiftMappingResult result = {};
+        result.originalTarget = candidate.target;
+
+        PathSample sample = candidate.sample;
+        const bool selectedIsNEE = sample.selectedKind == kPathSampleKindNEE;
+        const bool selectedIsBSDFTerminal = sample.selectedKind == kPathSampleKindHitLight || sample.selectedKind == kPathSampleKindEnv;
+        if ((sample.flags & kPathSampleFlagNeedsReplay) == 0u || (!selectedIsNEE && !selectedIsBSDFTerminal) || sample.selectedVertex < 2u)
+        {
+            result.rejectionReason = 8u;
+            return result;
+        }
+        if ((sample.flags & kPathSampleFlagAlreadyShifted) != 0u)
+        {
+            // A shifted replay sample no longer has a canonical primary prefix
+            // recoverable from pathSeed/pathID. Treat this as a replay
+            // self-consistency failure until temporal/replay state is expanded.
+            result.rejectionReason = 15u;
+            return result;
+        }
+        if (sample.reconnectVertex != 2u || sample.selectedVertex > kMaxStoredReplayLobes + 1u)
+        {
+            result.rejectionReason = 14u;
+            return result;
+        }
+
+        PathState path = {};
+        generatePath(sample.pathID, sample.pathSeed, path);
+        if (!path.isHit())
+        {
+            result.rejectionReason = 3u;
+            return result;
+        }
+
+        const uint maxReplayVertex = min(sample.selectedVertex, kMaxBounces + 1u);
+        float3 sourcePrimaryPosW = sample.primaryPosW;
+        float3 sourceFirstFactor = float3(0.f);
+        float3 shiftedFirstFactor = float3(0.f);
+        float3 sourceX2Factor = float3(1.f);
+        float3 shiftedX2Factor = float3(1.f);
+        float3 reconnectPosW = float3(0.f);
+        float3 reconnectNormalW = float3(0.f, 1.f, 0.f);
+        bool haveFirstConnection = false;
+        bool haveX2Ratio = sample.selectedVertex == 2u;
+        bool haveVisibility = false;
+        float sourceFirstPdf = 1.f;
+        float shiftedFirstPdf = 1.f;
+        float sourceX2Pdf = 1.f;
+        float shiftedX2Pdf = 1.f;
+
+        for (uint replayVertex = 1u; replayVertex <= maxReplayVertex; replayVertex++)
+        {
+            if (!path.isHit() || path.getVertexIndex() != replayVertex)
+            {
+                result.rejectionReason = 15u;
+                return result;
+            }
+
+            const bool isPrimaryHit = replayVertex == 1u;
+            const HitType hitType = path.hit.getType();
+            const bool isTriangleHit = hitType == HitType::Triangle;
+            const bool isCurveHit = kUseCurves && (hitType == HitType::Curve);
+            if (!isTriangleHit || isCurveHit || !path.interiorList.isEmpty() || path.isInsideDielectricVolume())
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+
+            ShadingData sd = loadShadingData(path.hit, path.origin, path.dir);
+            if (!handleNestedDielectrics(sd, path))
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+
+            let lod = createTextureSampler(path, isPrimaryHit);
+            let hints = getMaterialInstanceHints(path.hit, isPrimaryHit);
+            const IMaterialInstance mi = gScene.materials.getMaterialInstance(sd, lod, hints);
+            BSDFProperties bsdfProperties = mi.getProperties(sd);
+            bool isSpecular = bsdfProperties.roughness <= params.specularRoughnessThreshold;
+
+            if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && isSpecular)
+            {
+                sd.mtl.setActiveLobes((uint)LobeType::Diffuse);
+            }
+            if (!kUseLightsInDielectricVolumes && path.isInsideDielectricVolume())
+            {
+                bsdfProperties.emission = float3(0.f);
+            }
+            const uint lobeTypes = mi.getLobeTypes(sd);
+            const bool sourceConnectible = isFixedX2ReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
+            if (replayVertex == 2u && !sourceConnectible)
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+
+            if (replayVertex == sample.selectedVertex)
+            {
+                if (!haveFirstConnection || !haveX2Ratio || !haveVisibility)
+                {
+                    result.rejectionReason = 15u;
+                    return result;
+                }
+
+                float3 selectedRatio = float3(1.f);
+                if (selectedIsNEE && sample.selectedVertex == 2u)
+                {
+                    const float3 dstOrigin = dstSd.computeRayOrigin();
+                    const float3 dstToX2 = sd.posW - dstOrigin;
+                    const float dstDist = length(dstToX2);
+                    if (dstDist <= 1e-6f)
+                    {
+                        result.rejectionReason = 13u;
+                        return result;
+                    }
+
+                    ShadingData shiftedSd = loadShadingData(path.hit, dstOrigin, dstToX2 / dstDist);
+
+                    uint sourceNEEReason = 0u;
+                    uint shiftedNEEReason = 0u;
+                    float3 sourceNEE;
+                    float3 shiftedNEE;
+                    const uint2 sourcePixel = uint2(sample.pathID, sample.pathID >> 12) & 0xfff;
+                    if (!evaluateStoredNEEAtVertex(sample, sd, path.hit, sourcePixel, sourceNEE, sourceNEEReason) ||
+                        !evaluateStoredNEEAtVertex(sample, shiftedSd, path.hit, dstPixel, shiftedNEE, shiftedNEEReason))
+                    {
+                        result.rejectionReason = shiftedNEEReason != 0u ? shiftedNEEReason : sourceNEEReason;
+                        return result;
+                    }
+                    selectedRatio = safeColorRatio(shiftedNEE, sourceNEE);
+                }
+
+                const float3 shiftedContribution = candidate.sample.contribution *
+                    safeColorRatio(shiftedFirstFactor, sourceFirstFactor) *
+                    safeColorRatio(shiftedX2Factor, sourceX2Factor) *
+                    selectedRatio;
+                float3 finalShiftedContribution = shiftedContribution;
+                if (selectedIsBSDFTerminal)
+                {
+                    if (sourceFirstPdf <= 0.f || shiftedFirstPdf <= 0.f || sourceX2Pdf <= 0.f || shiftedX2Pdf <= 0.f)
+                    {
+                        result.rejectionReason = 13u;
+                        return result;
+                    }
+                    // The stored terminal contribution was sampled in the
+                    // source BSDF measure. We move the reciprocal PDF ratios
+                    // into the shifted contribution and the matching forward
+                    // PDF ratios into the GRIS Jacobian below so their product
+                    // represents the fixed-x2 mapped contribution measure.
+                    finalShiftedContribution *= (sourceFirstPdf / shiftedFirstPdf) * (sourceX2Pdf / shiftedX2Pdf);
+                }
+                const float shiftedTarget = max(0.f, luminance(finalShiftedContribution));
+                if (shiftedTarget <= 0.f)
+                {
+                    result.rejectionReason = 10u;
+                    return result;
+                }
+
+                const float jacobian = computeVertexReconnectJacobian(sourcePrimaryPosW, dstSd.posW, reconnectPosW, reconnectNormalW);
+                float finalJacobian = jacobian;
+                if (selectedIsBSDFTerminal)
+                {
+                    // See the paired contribution-side PDF ratio above.
+                    finalJacobian *= (shiftedFirstPdf / sourceFirstPdf) * (shiftedX2Pdf / sourceX2Pdf);
+                }
+                if (finalJacobian <= 0.f || isnan(finalJacobian) || isinf(finalJacobian) || finalJacobian > params.maxReconnectJacobian)
+                {
+                    result.rejectionReason = 13u;
+                    return result;
+                }
+
+                result.valid = true;
+                result.shiftedContribution = finalShiftedContribution;
+                result.shiftedTarget = shiftedTarget;
+                result.targetRatio = candidate.target > 0.f ? shiftedTarget / candidate.target : 0.f;
+                result.jacobian = finalJacobian;
+                result.rejectionReason = 0u;
+                return result;
+            }
+
+            if (hasFinishedSurfaceBounces(path))
+            {
+                result.rejectionReason = 15u;
+                return result;
+            }
+
+            path.origin = sd.computeRayOrigin();
+            if (!consumeReplayNEE(sd, mi, lobeTypes, false, false, path))
+            {
+                result.rejectionReason = 15u;
+                return result;
+            }
+
+            if (kUseRussianRoulette)
+            {
+                if (terminatePathByRussianRoulette(path, sampleNext1D(path.sg)))
+                {
+                    result.rejectionReason = 15u;
+                    return result;
+                }
+            }
+
+            BSDFSample bs;
+            bool validScatter = mi.sample(sd, path.sg, bs, kUseBSDFSampling);
+            if (!validScatter || bs.pdf <= 0.f || bs.isLobe(LobeType::Delta) || bs.isLobe(LobeType::Transmission))
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+            const uint expectedLobe = getSampleReplayLobeTag(sample, replayVertex);
+            if (!isNonDeltaReflectionLobe(expectedLobe) || bs.lobeType != expectedLobe)
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+
+            const float3 sampledDir = bs.wo;
+            const float3 sourceScatterFactor = bs.weight * bs.pdf;
+            const float sourceScatterPdf = bs.pdf;
+            if (!any(sourceScatterFactor > 0.f))
+            {
+                result.rejectionReason = 10u;
+                return result;
+            }
+
+            if (!generateScatterRay(bs, sd, mi, path) || path.isSpecular() || path.isDelta() || path.isTransmission())
+            {
+                result.rejectionReason = 14u;
+                return result;
+            }
+
+            if (replayVertex == 1u)
+            {
+                sourceFirstFactor = sourceScatterFactor;
+                sourceFirstPdf = sourceScatterPdf;
+            }
+            if (replayVertex == 2u && sample.selectedVertex > 2u)
+            {
+                sourceX2Factor = sourceScatterFactor;
+                sourceX2Pdf = sourceScatterPdf;
+
+                const float3 dstOrigin = dstSd.computeRayOrigin();
+                const float3 dstToX2 = sd.posW - dstOrigin;
+                const float dstDist = length(dstToX2);
+                if (dstDist <= 1e-6f)
+                {
+                    result.rejectionReason = 13u;
+                    return result;
+                }
+
+                ShadingData shiftedX2Sd = loadShadingData(path.hit, dstOrigin, dstToX2 / dstDist);
+                let x2Lod = ExplicitLodTextureSampler(0.f);
+                let x2Hints = getMaterialInstanceHints(path.hit, false);
+                const IMaterialInstance shiftedX2Mi = gScene.materials.getMaterialInstance(shiftedX2Sd, x2Lod, x2Hints);
+                TinyUniformSampleGenerator x2EvalSg = TinyUniformSampleGenerator(dstPixel, params.frameCount);
+                BSDFProperties shiftedX2Properties = shiftedX2Mi.getProperties(shiftedX2Sd);
+                const uint x2Lobe = getSampleReplayLobeTag(sample, 2u);
+                if (shiftedX2Properties.roughness <= params.specularRoughnessThreshold ||
+                    !isNonDeltaReflectionLobe(x2Lobe) ||
+                    !canRealizeReplayLobe(shiftedX2Mi.getLobeTypes(shiftedX2Sd), x2Lobe))
+                {
+                    result.rejectionReason = 14u;
+                    return result;
+                }
+                shiftedX2Factor = shiftedX2Mi.eval(shiftedX2Sd, sampledDir, x2EvalSg);
+                shiftedX2Pdf = shiftedX2Mi.evalPdf(shiftedX2Sd, sampledDir, kUseBSDFSampling);
+                if (!any(shiftedX2Factor > 0.f))
+                {
+                    result.rejectionReason = 10u;
+                    return result;
+                }
+                if (selectedIsBSDFTerminal && shiftedX2Pdf <= 0.f)
+                {
+                    result.rejectionReason = 13u;
+                    return result;
+                }
+                haveX2Ratio = true;
+            }
+
+            float hitT;
+            if (!traceReplayNextHit(path, hitT))
+            {
+                if (selectedIsBSDFTerminal && sample.selectedKind == kPathSampleKindEnv && replayVertex + 1u == sample.selectedVertex)
+                {
+                    if (!haveFirstConnection || !haveX2Ratio || !haveVisibility || sourceFirstPdf <= 0.f || shiftedFirstPdf <= 0.f || sourceX2Pdf <= 0.f || shiftedX2Pdf <= 0.f)
+                    {
+                        result.rejectionReason = 15u;
+                        return result;
+                    }
+
+                    const float3 shiftedContribution = candidate.sample.contribution *
+                        safeColorRatio(shiftedFirstFactor, sourceFirstFactor) *
+                        safeColorRatio(shiftedX2Factor, sourceX2Factor) *
+                        (sourceFirstPdf / shiftedFirstPdf) *
+                        (sourceX2Pdf / shiftedX2Pdf);
+                    const float shiftedTarget = max(0.f, luminance(shiftedContribution));
+                    if (shiftedTarget <= 0.f)
+                    {
+                        result.rejectionReason = 10u;
+                        return result;
+                    }
+
+                    float jacobian = computeVertexReconnectJacobian(sourcePrimaryPosW, dstSd.posW, reconnectPosW, reconnectNormalW);
+                    // Keep the same terminal PDF/Jacobian convention as the
+                    // finite-hit terminal branch above.
+                    jacobian *= (shiftedFirstPdf / sourceFirstPdf) * (shiftedX2Pdf / sourceX2Pdf);
+                    if (jacobian <= 0.f || isnan(jacobian) || isinf(jacobian) || jacobian > params.maxReconnectJacobian)
+                    {
+                        result.rejectionReason = 13u;
+                        return result;
+                    }
+
+                    result.valid = true;
+                    result.shiftedContribution = shiftedContribution;
+                    result.shiftedTarget = shiftedTarget;
+                    result.targetRatio = candidate.target > 0.f ? shiftedTarget / candidate.target : 0.f;
+                    result.jacobian = jacobian;
+                    result.rejectionReason = 0u;
+                    return result;
+                }
+                result.rejectionReason = 15u;
+                return result;
+            }
+
+            if (replayVertex == 1u)
+            {
+                ShadingData x2SourceSd = loadShadingData(path.hit, path.origin, path.dir);
+                reconnectPosW = x2SourceSd.posW;
+                reconnectNormalW = x2SourceSd.faceN;
+
+                const float3 dstOrigin = dstSd.computeRayOrigin();
+                const float3 dstToX2 = reconnectPosW - dstOrigin;
+                const float dstDist = length(dstToX2);
+                if (dstDist <= 1e-6f)
+                {
+                    result.rejectionReason = 13u;
+                    return result;
+                }
+
+                SceneRayQuery<kUseAlphaTest> visibilityQuery;
+                if (!visibilityQuery.traceVisibilityRay(Ray(dstOrigin, dstToX2 / dstDist, 0.f, dstDist)))
+                {
+                    result.rejectionReason = 11u;
+                    return result;
+                }
+
+                let dstLod = ExplicitLodTextureSampler(0.f);
+                let dstHints = getMaterialInstanceHints(dstHit, true);
+                const IMaterialInstance dstMi = gScene.materials.getMaterialInstance(dstSd, dstLod, dstHints);
+                TinyUniformSampleGenerator dstEvalSg = TinyUniformSampleGenerator(dstPixel, params.frameCount);
+                BSDFProperties dstBsdfProperties = dstMi.getProperties(dstSd);
+                const uint primaryLobe = getSampleReplayLobeTag(sample, 1u);
+                if (dstBsdfProperties.roughness <= params.specularRoughnessThreshold ||
+                    !isNonDeltaReflectionLobe(primaryLobe) ||
+                    !canRealizeReplayLobe(dstMi.getLobeTypes(dstSd), primaryLobe))
+                {
+                    result.rejectionReason = 14u;
+                    return result;
+                }
+                const float3 dstConnectionDir = dstToX2 / dstDist;
+                shiftedFirstFactor = dstMi.eval(dstSd, dstConnectionDir, dstEvalSg);
+                shiftedFirstPdf = dstMi.evalPdf(dstSd, dstConnectionDir, kUseBSDFSampling);
+                if (!any(shiftedFirstFactor > 0.f))
+                {
+                    result.rejectionReason = 10u;
+                    return result;
+                }
+                if (selectedIsBSDFTerminal && shiftedFirstPdf <= 0.f)
+                {
+                    result.rejectionReason = 13u;
+                    return result;
+                }
+
+                haveFirstConnection = true;
+                haveVisibility = true;
+            }
+        }
+
+        result.rejectionReason = 15u;
+        return result;
     }
 
     /** Handle hits on dielectrics.
@@ -978,6 +1991,10 @@ struct ReSTIRPT
             bsdfProperties.emission = float3(0.f);
         }
 
+        const uint lobeTypes = mi.getLobeTypes(sd);
+        const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
+        updateFixedX2ReconnectVertex(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
+
         // Check if the scatter event is samplable by the light sampling technique.
         const bool isLightSamplable = path.isLightSamplable();
 
@@ -988,31 +2005,39 @@ struct ReSTIRPT
         if (computeEmissive && any(bsdfProperties.emission > 0.f))
         {
             float misWeight = 1.f;
+            float lightPdf = 0.f;
+            float scatterPdf = path.pdf;
+            uint triangleIndex = 0xffffffffu;
+            uint reusableFlags = select(path.isLightSampledUpper(), kReusableLightFlagSampleUpper, 0u) |
+                                 select(path.isLightSampledLower(), kReusableLightFlagSampleLower, 0u);
+
+            if (kUseEmissiveLights && isTriangleHit && !isPrimaryHit)
+            {
+                TriangleLightHit hit;
+                TriangleHit triangleHit = path.hit.getTriangleHit();
+                triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
+                hit.triangleIndex = triangleIndex;
+                hit.posW = sd.posW;
+                hit.normalW = sd.getOrientedFaceNormal();
+
+                bool upperHemisphere = path.isLightSampledUpper() && !path.isLightSampledLower();
+                lightPdf = triangleIndex != 0xffffffffu ? getEmissiveSelectionProbability() * emissiveSampler.evalPdf(path.origin, path.normal, upperHemisphere, hit) : 0.f;
+            }
+
             if (kUseEmissiveLights && kUseNEE && kUseMIS && isTriangleHit && !isPrimaryHit && path.isLightSampled() && isLightSamplable)
             {
                 // If NEE and MIS are enabled, and we've already sampled emissive lights,
                 // then we need to evaluate the MIS weight here to account for the remaining contribution.
                 // Note that MIS is only applied for hits on emissive triangles (other emissive geometry is not supported).
 
-                // Prepare hit point struct with data needed for emissive light PDF evaluation.
-                TriangleLightHit hit;
-                TriangleHit triangleHit = path.hit.getTriangleHit();
-                hit.triangleIndex = gScene.lightCollection.getTriangleIndex(triangleHit.instanceID, triangleHit.primitiveIndex);
-                hit.posW = sd.posW;
-                hit.normalW = sd.getOrientedFaceNormal();
-
-                // Evaluate PDF at the hit, had it been generated with light sampling.
-                // Emissive light samplers have an option to exclusively sample the upper hemisphere.
-                bool upperHemisphere = path.isLightSampledUpper() && !path.isLightSampledLower();
-                float lightPdf = getEmissiveSelectionProbability() * emissiveSampler.evalPdf(path.origin, path.normal, upperHemisphere, hit);
-
                 // Compute MIS weight by combining this with BSDF sampling.
                 // Note we can assume path.pdf > 0.f since we shouldn't have got here otherwise.
                 misWeight = evalMIS(1, path.pdf, 1, lightPdf);
+                reusableFlags |= kReusableLightFlagUseMIS;
             }
 
             // Accumulate emitted radiance weighted by path throughput and MIS weight.
-            addToPathContribution(path, misWeight * bsdfProperties.emission);
+            addHitLightPathContribution(path, misWeight * bsdfProperties.emission, bsdfProperties.emission, sd, triangleIndex, lightPdf, scatterPdf, reusableFlags);
         }
 
         // Terminate after scatter ray on last vertex has been processed.
@@ -1037,10 +2062,6 @@ struct ReSTIRPT
         {
             path.origin = sd.computeRayOrigin();
         }
-
-        // Determine if BSDF has non-delta lobes.
-        const uint lobeTypes = mi.getLobeTypes(sd);
-        const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
 
         // Check if we should apply NEE.
         const bool applyNEE = kUseNEE && hasNonDeltaLobes;
@@ -1067,9 +2088,11 @@ struct ReSTIRPT
             if (validSample)
             {
                 // Apply MIS weight.
-                if (kUseMIS && ls.lightType != (uint)LightType::Analytic)
+                if (kUseMIS && ls.lightType != (uint)SampledLightType::Analytic)
                 {
                     float scatterPdf = mi.evalPdf(sd, ls.dir, kUseBSDFSampling);
+                    ls.scatterPdf = scatterPdf;
+                    ls.flags |= kReusableLightFlagUseMIS;
                     ls.Li *= evalMIS(1, ls.pdf, 1, scatterPdf);
                 }
 
@@ -1092,7 +2115,7 @@ struct ReSTIRPT
 
                     logTraceRay(PixelStatsRayType::Visibility);
                     bool visible = vq.traceVisibilityRay(ray);
-                    if (visible) addToPathContribution(path, Lr);
+                    if (visible) addNEEPathContribution(path, Lr, ls);
                 }
             }
         }
@@ -1153,21 +2176,23 @@ struct ReSTIRPT
             logPathVertex();
 
             float misWeight = 1.f;
+            float lightPdf = getEnvMapSelectionProbability() * envMapSampler.evalPdf(path.dir);
+            uint reusableFlags = 0u;
             if (kUseNEE && kUseMIS && path.isLightSampled() && isLightSamplable)
             {
                 // If NEE and MIS are enabled, and we've already sampled the env map,
                 // then we need to evaluate the MIS weight here to account for the remaining contribution.
 
                 // Evaluate PDF, had it been generated with light sampling.
-                float lightPdf = getEnvMapSelectionProbability() * envMapSampler.evalPdf(path.dir);
 
                 // Compute MIS weight by combining this with BSDF sampling.
                 // Note we can assume path.pdf > 0.f since we shouldn't have got here otherwise.
                 misWeight = evalMIS(1, path.pdf, 1, lightPdf);
+                reusableFlags |= kReusableLightFlagUseMIS;
             }
 
             float3 Le = envMapSampler.eval(path.dir);
-            addToPathContribution(path, misWeight * Le);
+            addEnvPathContribution(path, misWeight * Le, Le, lightPdf, path.pdf, reusableFlags);
 
             if (kOutputGuideData && path.getVertexIndex() == 2
                 && (path.getBounces(BounceType::Specular) == 1
@@ -1188,21 +2213,15 @@ struct ReSTIRPT
         path.terminate();
     }
 
-    /** Write path contribution to output buffer.
+    /** Write per-sample outputs used by guide/debug resolve paths.
     */
-    void writeOutput(const PathState path)
+    void writeSampleOutputs(const PathState path, const PathReservoir reservoir)
     {
-        assert(!any(isnan(path.L)));
-
-        PathReservoir reservoir = makeInitialReservoir(path);
-
         // Log path length.
         logPathLength(reservoir.sample.pathLength);
 
         const uint2 pixel = path.getPixel();
         const uint outIdx = params.getSampleOffset(pixel) + path.getSampleIdx();
-        reservoir = applyIdentityShift(reservoir, pixel);
-        currentReservoirs[pixel.y * params.frameDim.x + pixel.x] = reservoir;
 
         const float3 color = getDebugReservoirColor(reservoir);
 
@@ -1222,5 +2241,14 @@ struct ReSTIRPT
             sampleGuideData[outIdx] = path.guideData;
         }
 
+    }
+
+    /** Publish the selected per-pixel reservoir and its debug/beauty output.
+    */
+    void writeReservoirOutput(const uint2 pixel, PathReservoir reservoir)
+    {
+        reservoir = applyIdentityShift(reservoir, pixel);
+        currentReservoirs[pixel.y * params.frameDim.x + pixel.x] = reservoir;
+        outputColor[pixel] = float4(getDebugReservoirColor(reservoir), 1.f);
     }
 };

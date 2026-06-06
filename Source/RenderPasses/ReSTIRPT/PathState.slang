@@ -36,6 +36,82 @@ static const uint kMaxRejectedHits = 16; // Maximum number of rejected hits alon
 
 static const float kRayTMax = 1e30f;
 
+static const uint kPathSampleFlagValid = 1u << 0;             ///< Sample carries a finite selected path contribution.
+static const uint kPathSampleFlagCanReconnectAtX2 = 1u << 1;  ///< Sample can be shifted by replacing x1 with the destination primary hit and reconnecting to x2.
+static const uint kPathSampleFlagNeedsReplay = 1u << 2;       ///< Sample requires source path replay/tail evaluation before the fixed-x2 reconnection shift.
+static const uint kPathSampleFlagAlreadyShifted = 1u << 3;    ///< Sample has already been shifted into another primary domain; replayed suffix imports must not replay it as canonical.
+
+static const uint kPathSampleKindInvalid = 0u;
+static const uint kPathSampleKindHitLight = 1u;               ///< BSDF-sampled hit on an emissive surface.
+static const uint kPathSampleKindNEE = 2u;                    ///< Next-event-estimation light sample.
+static const uint kPathSampleKindEnv = 3u;                    ///< BSDF-sampled environment hit.
+
+static const uint kInvalidReconnectVertex = 0u;
+static const uint kMaxStoredReplayLobes = 8u;                 ///< One 8-bit sampled lobe tag for scatter vertices 1..8.
+
+uint hashPathState(uint v)
+{
+    v ^= v >> 16;
+    v *= 0x7feb352du;
+    v ^= v >> 15;
+    v *= 0x846ca68bu;
+    v ^= v >> 16;
+    return v;
+}
+
+uint makePathSeed(uint pathID, uint frameSeed)
+{
+    return hashPathState(pathID ^ hashPathState(frameSeed + 0x9e3779b9u));
+}
+
+float sampleNextRIS(inout uint state)
+{
+    state = hashPathState(state);
+    return float(state & 0x00ffffffu) / float(0x01000000u);
+}
+
+void setReplayLobeTag(inout uint tags0, inout uint tags1, uint vertex, uint lobeType)
+{
+    if (vertex == 0u || vertex > kMaxStoredReplayLobes) return;
+
+    const uint byteIndex = vertex - 1u;
+    const uint shift = (byteIndex & 3u) << 3;
+    const uint mask = 0xffu << shift;
+    const uint value = (lobeType & 0xffu) << shift;
+    if (byteIndex < 4u) tags0 = (tags0 & ~mask) | value;
+    else tags1 = (tags1 & ~mask) | value;
+}
+
+uint getReplayLobeTag(uint tags0, uint tags1, uint vertex)
+{
+    if (vertex == 0u || vertex > kMaxStoredReplayLobes) return 0u;
+
+    const uint byteIndex = vertex - 1u;
+    const uint shift = (byteIndex & 3u) << 3;
+    return byteIndex < 4u ? ((tags0 >> shift) & 0xffu) : ((tags1 >> shift) & 0xffu);
+}
+
+bool hasReplayLobeTag(uint tags0, uint tags1, uint vertex)
+{
+    return getReplayLobeTag(tags0, tags1, vertex) != 0u;
+}
+
+uint packPathRISMetadata(uint risCandidateCount, uint selectedCandidate, uint selectedKind, uint selectedVertex)
+{
+    return (min(risCandidateCount, 0xffu) & 0xffu) |
+           ((min(selectedCandidate, 0xffu) & 0xffu) << 8) |
+           ((selectedKind & 0xfu) << 16) |
+           ((selectedVertex & 0x3ffu) << 20);
+}
+
+void unpackPathRISMetadata(uint packed, out uint risCandidateCount, out uint selectedCandidate, out uint selectedKind, out uint selectedVertex)
+{
+    risCandidateCount = packed & 0xffu;
+    selectedCandidate = (packed >> 8) & 0xffu;
+    selectedKind = (packed >> 16) & 0xfu;
+    selectedVertex = (packed >> 20) & 0x3ffu;
+}
+
 // Be careful with changing these. PathFlags share 32-bit uint with vertexIndex. For now, we keep 10 bits for vertexIndex.
 // PathFlags take higher bits, VertexIndex takes lower bits.
 static const uint kVertexIndexBitCount = 10u;
@@ -82,6 +158,15 @@ enum class BounceType
 struct PathState
 {
     uint        id;                     ///< Path ID encodes (pixel, sampleIdx) with 12 bits each for pixel x|y and 8 bits for sample index.
+    uint        pathSeed;               ///< Stable seed for replaying the path's sampling decisions.
+    uint        risState;               ///< Independent RNG state for RIS decisions. This must not perturb path sampling/replay.
+    uint        risCandidateCount;      ///< Number of positive path-tree candidates seen by initial RIS.
+    uint        selectedCandidate;      ///< Index of the candidate selected by initial RIS.
+    uint        selectedKind;           ///< kPathSampleKind* value for the selected candidate.
+    uint        selectedVertex;         ///< Path vertex at which the selected candidate was generated.
+    uint        reconnectVertex;        ///< Fixed pure-reconnection suffix vertex. Currently 2 for reusable x2 tails, or kInvalidReconnectVertex.
+    uint        scatterLobeTags0;       ///< Packed sampled BSDF lobe tags for replay scatter vertices 1..4.
+    uint        scatterLobeTags1;       ///< Packed sampled BSDF lobe tags for replay scatter vertices 5..8.
 
     uint        flagsAndVertexIndex;    ///< Higher kPathFlagsBitCount bits: Flags indicating the current status. This can be multiple PathFlags flags OR'ed together.
                                         ///< Lower kVertexIndexBitCount bits: Current vertex index (0 = camera, 1 = primary hit, 2 = secondary hit, etc.).
@@ -100,6 +185,18 @@ struct PathState
     float3      L;                      ///< RIS-selected path-tree contribution.
     float       risTarget;              ///< Target value of the selected contribution.
     float       risWeightSum;           ///< Sum of path-tree RIS candidate weights.
+    float3      reusableLightPosW;       ///< Selected finite NEE light point, if the light has one.
+    float3      reusableLightNormalW;    ///< Selected finite/area light normal, if applicable.
+    float3      reusableLightLi;         ///< Selected light radiance/value before destination PDF division.
+    float3      reusableLightDir;        ///< Selected light direction for env/directional lights and diagnostics.
+    float       reusableLightDistance;   ///< Selected light distance for visibility.
+    float       reusableLightPdf;        ///< Full source light-sampling PDF including light-type selection.
+    float       reusableScatterPdf;      ///< Source BSDF PDF used for MIS diagnostics.
+    uint        reusableLightType;       ///< LightType of selected reusable NEE sample.
+    uint        reusableLightValid;      ///< True if selected candidate can enter direct-light reconnection.
+    uint        reusableLightIndex;      ///< Analytic light index, if applicable.
+    uint        reusableLightTriangleIndex; ///< Emissive triangle index, if applicable.
+    uint        reusableLightFlags;      ///< Bitfield for NEE sampling metadata used by shifted MIS.
 
     GuideData   guideData;              ///< Per-sample guide data.
     InteriorList interiorList;          ///< Interior list. Keeping track of a stack of materials with medium properties.
@@ -214,20 +311,43 @@ struct PathState
 
 /** Compact reusable path sample selected by initial path-tree RIS.
 
-    This is the state that future temporal/spatial shift mappings will try to
-    replay or re-evaluate in a different pixel's path space. The current
-    milestone only uses identity reuse, but keeping this explicit prevents the
-    selected candidate from being hidden inside transient PathState fields.
+    This is the state that temporal/spatial shift mappings replay or re-evaluate
+    in a different pixel's path space. Current spatial reuse implements a fixed
+    x2 pure reconnection shift: Y=(y0,y1,x2,...), where the destination pixel
+    supplies y0/y1 and the source sample supplies the suffix beginning at x2.
 */
 struct PathSample
 {
     uint        pathID;                  ///< Encoded pixel/sample id of the candidate that generated this sample.
+    uint        pathSeed;                ///< Stable replay seed for recovering the source path.
     uint        selectedCandidate;       ///< Candidate index within the initial path-tree RIS batch.
+    uint        risCandidateCount;       ///< Number of positive path-tree RIS candidates in the source path.
+    uint        selectedKind;            ///< kPathSampleKind* value for the selected candidate.
+    uint        selectedVertex;          ///< Source path vertex where the selected event was generated.
+    uint        reconnectVertex;         ///< Fixed pure-reconnection suffix vertex. Currently 2 for reusable x2 tails, or kInvalidReconnectVertex.
+    uint        scatterLobeTags0;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 1..4.
+    uint        scatterLobeTags1;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 5..8.
     uint        pathLength;              ///< Terminated path length used for debug and future compatibility checks.
     uint        flags;                   ///< Validity and future shift-mapping flags.
     uint        rngState;                ///< Compact replay seed placeholder for future path replay.
+    uint        primaryMaterialID;       ///< Material ID at the source primary surface.
     float       target;                  ///< Unnormalized target p-hat for the selected candidate.
     float3      contribution;            ///< Full selected candidate contribution before reservoir normalization.
+    float3      primaryPosW;             ///< World-space position of the source primary hit.
+    float3      primaryNormalW;          ///< World-space geometric normal at the source primary hit.
+    float       primaryDepth;            ///< Distance from camera to the source primary hit.
+    uint        reusableLightType;       ///< LightType for the stored NEE reconnection sample.
+    uint        reusableLightValid;      ///< True if direct-light reconnection data is populated.
+    uint        reusableLightIndex;      ///< Analytic light index, if applicable.
+    uint        reusableLightTriangleIndex; ///< Emissive triangle index, if applicable.
+    float3      reusableLightPosW;       ///< Stored finite light point for direct-light reconnection.
+    float3      reusableLightNormalW;    ///< Stored finite/area light normal for direct-light reconnection.
+    float3      reusableLightLi;         ///< Stored light radiance/value before destination PDF division.
+    float3      reusableLightDir;        ///< Stored env/directional light direction.
+    float       reusableLightDistance;   ///< Stored light distance for visibility.
+    float       reusableLightPdf;        ///< Full source light-sampling PDF including light-type selection.
+    float       reusableScatterPdf;      ///< Source BSDF PDF used for MIS diagnostics.
+    uint        reusableLightFlags;      ///< Bitfield for NEE sampling metadata used by shifted MIS.
 };
 
 /** Explicit ReSTIR PT reservoir for one pixel.
@@ -243,6 +363,9 @@ struct PathReservoir
     float      targetRatio;              ///< shiftedTarget / originalTarget for diagnostics.
     float      jacobian;                 ///< Shift mapping Jacobian. Identity shift uses 1.
     uint       rejectionReason;          ///< 0 = accepted, nonzero = rejected by shift mapping.
+    uint       acceptedCount;            ///< Spatial/temporal combine diagnostics.
+    uint       rejectedCount;            ///< Spatial/temporal combine diagnostics.
+    float      selectedDistance;         ///< Distance to the selected spatial neighbor for diagnostics.
 };
 
 /** Result of evaluating a selected path sample through a shift mapping.

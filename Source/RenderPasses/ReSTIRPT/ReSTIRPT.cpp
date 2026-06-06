@@ -97,6 +97,8 @@ namespace
     const std::string kUseLightsInDielectricVolumes = "useLightsInDielectricVolumes";
     const std::string kDisableCaustics = "disableCaustics";
     const std::string kSpecularRoughnessThreshold = "specularRoughnessThreshold";
+    const std::string kMinReconnectDistance = "minReconnectDistance";
+    const std::string kMaxReconnectJacobian = "maxReconnectJacobian";
     const std::string kPrimaryLodMode = "primaryLodMode";
     const std::string kLODBias = "lodBias";
 
@@ -108,6 +110,7 @@ namespace
     const std::string kSpatialNeighborCount = "spatialNeighborCount";
     const std::string kSpatialRadius = "spatialRadius";
     const std::string kSpatialIterations = "spatialIterations";
+    const std::string kSpatialMISStrategy = "spatialMISStrategy";
 
     const Gui::DropdownList kDebugViewList =
     {
@@ -125,6 +128,9 @@ namespace
         { 11u, "Spatial rejected count" },
         { 12u, "Spatial combined M" },
         { 13u, "Spatial source distance" },
+        { 14u, "Spatial rejection reason" },
+        { 15u, "Spatial shift mask" },
+        { 16u, "Replay mismatch mask" },
     };
 }
 
@@ -214,6 +220,8 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kUseLightsInDielectricVolumes) mStaticParams.useLightsInDielectricVolumes = value;
         else if (key == kDisableCaustics) mStaticParams.disableCaustics = value;
         else if (key == kSpecularRoughnessThreshold) mParams.specularRoughnessThreshold = value;
+        else if (key == kMinReconnectDistance) mParams.minReconnectDistance = value;
+        else if (key == kMaxReconnectJacobian) mParams.maxReconnectJacobian = value;
         else if (key == kPrimaryLodMode) mStaticParams.primaryLodMode = value;
         else if (key == kLODBias) mParams.lodBias = value;
 
@@ -226,6 +234,7 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kSpatialNeighborCount) mSpatialNeighborCount = value;
         else if (key == kSpatialRadius) mSpatialRadius = value;
         else if (key == kSpatialIterations) mSpatialIterations = value;
+        else if (key == kSpatialMISStrategy) mSpatialMISStrategy = value;
 
         else logWarning("Unknown property '{}' in ReSTIRPT properties.", key);
     }
@@ -261,6 +270,16 @@ void ReSTIRPT::validateOptions()
     {
         logWarning("'specularRoughnessThreshold' has invalid value. Clamping to range [0,1].");
         mParams.specularRoughnessThreshold = std::clamp(mParams.specularRoughnessThreshold, 0.f, 1.f);
+    }
+    if (mParams.minReconnectDistance < 0.f)
+    {
+        logWarning("'minReconnectDistance' has invalid value. Clamping to 0.");
+        mParams.minReconnectDistance = 0.f;
+    }
+    if (mParams.maxReconnectJacobian <= 0.f)
+    {
+        logWarning("'maxReconnectJacobian' has invalid value. Resetting to 1e4.");
+        mParams.maxReconnectJacobian = 1e4f;
     }
 
     // Static parameters.
@@ -334,6 +353,8 @@ Properties ReSTIRPT::getProperties() const
     props[kUseLightsInDielectricVolumes] = mStaticParams.useLightsInDielectricVolumes;
     props[kDisableCaustics] = mStaticParams.disableCaustics;
     props[kSpecularRoughnessThreshold] = mParams.specularRoughnessThreshold;
+    props[kMinReconnectDistance] = mParams.minReconnectDistance;
+    props[kMaxReconnectJacobian] = mParams.maxReconnectJacobian;
     props[kPrimaryLodMode] = mStaticParams.primaryLodMode;
     props[kLODBias] = mParams.lodBias;
 
@@ -346,6 +367,7 @@ Properties ReSTIRPT::getProperties() const
     props[kSpatialNeighborCount] = mSpatialNeighborCount;
     props[kSpatialRadius] = mSpatialRadius;
     props[kSpatialIterations] = mSpatialIterations;
+    props[kSpatialMISStrategy] = mSpatialMISStrategy;
 
     return props;
 }
@@ -547,7 +569,7 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
     if (auto group = widget.group("Spatial reuse"))
     {
         runtimeDirty |= group.checkbox("Enable spatial reuse", mUseSpatialReuse);
-        group.tooltip("Combines nearby ReSTIR PT reservoirs using the current identity evaluation path. This is a skeleton for later shift mappings.");
+        group.tooltip("Combines nearby ReSTIR PT reservoirs using a canonical self sample, direct terminal reconnection, and conservative source-tail replay for deeper selected NEE/terminal events. Primary NEE neighbor import is disabled.");
 
         if (mUseSpatialReuse)
         {
@@ -556,6 +578,7 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
             runtimeDirty |= group.var("Neighbor count", mSpatialNeighborCount, 0u, 32u);
             runtimeDirty |= group.var("Radius", mSpatialRadius, 1u, 128u);
             runtimeDirty |= group.var("Iterations", mSpatialIterations, 1u, 1u);
+            runtimeDirty |= group.dropdown("Spatial MIS", mSpatialMISStrategy);
         }
     }
 
@@ -578,6 +601,12 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
 
         runtimeDirty |= widget.var("Specular roughness threshold", mParams.specularRoughnessThreshold, 0.f, 1.f);
         widget.tooltip("Specular reflection events are only classified as specular if the material's roughness value is equal or smaller than this threshold. Otherwise they are classified diffuse.");
+
+        runtimeDirty |= widget.var("Min reconnect distance", mParams.minReconnectDistance, 0.f, 1.f, 0.001f);
+        widget.tooltip("Reject path-space reconnections shorter than this scene-space distance.");
+
+        runtimeDirty |= widget.var("Max reconnect Jacobian", mParams.maxReconnectJacobian, 1.f, 1e6f);
+        widget.tooltip("Reject path-space reconnections with larger Jacobians instead of clamping them.");
 
         dirty |= widget.dropdown("Primary LOD Mode", mStaticParams.primaryLodMode);
         widget.tooltip("Texture LOD mode at primary hit");
@@ -662,7 +691,10 @@ ReSTIRPT::TracePass::TracePass(ref<Device> pDevice, const std::string& name, con
     ProgramDesc desc;
     desc.addShaderModules(pScene->getShaderModules());
     desc.addShaderLibrary(kTracePassFilename);
-    desc.setMaxPayloadSize(160); // This is conservative but the required minimum is 140 bytes.
+    // The ReSTIR PT payload extends PathTracerN with reusable NEE light data for
+    // spatial reconnection. Keep this comfortably above the reflected payload size
+    // so DispatchRays does not fail validation when the shader table is launched.
+    desc.setMaxPayloadSize(320);
     desc.setMaxAttributeSize(pScene->getRaytracingMaxAttributeSize());
     desc.setMaxTraceRecursionDepth(1);
     if (!pScene->hasProceduralGeometry()) desc.setRtPipelineFlags(RtPipelineFlags::SkipProceduralPrimitives);
@@ -1212,19 +1244,26 @@ void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData&
 
     FALCOR_ASSERT(mpSpatialReusePass);
 
+    mpSpatialReusePass->addDefine("USE_VIEW_DIR", (mpScene->getCamera()->getApertureRadius() > 0 && renderData[kInputViewDir] != nullptr) ? "1" : "0");
+
     // This pass consumes the initial reservoirs written by ray tracing and
-    // produces a second reservoir set. It intentionally has no scene bindings yet;
-    // once real shift mappings are implemented, this is where destination-surface
-    // data, visibility, and reconnection inputs should be bound.
+    // produces a second reservoir set. It binds both the scene and ReSTIRPT
+    // parameter block because light reconnection evaluates destination-side
+    // env/emissive PDFs using the same samplers as the initial NEE pass.
     auto var = mpSpatialReusePass->getRootVar()["CB"]["gSpatialReusePass"];
     var["params"].setBlob(mParams);
     var["inputReservoirs"] = mpCurrentReservoirs;
     var["outputReservoirs"] = mpSpatialReservoirs;
     var["outputColor"] = renderData.getTexture(kOutputColor);
+    var["vbuffer"] = renderData.getTexture(kInputVBuffer);
+    var["viewDir"] = renderData.getTexture(kInputViewDir);
     var["neighborCount"] = mSpatialNeighborCount;
     var["radius"] = mSpatialRadius;
     var["debugView"] = mDebugView;
+    var["misStrategy"] = static_cast<uint32_t>(mSpatialMISStrategy);
 
+    mpSpatialReusePass->getRootVar()["gReSTIRPT"] = mpReSTIRPTBlock;
+    mpScene->bindShaderData(mpSpatialReusePass->getRootVar()["gScene"]);
     mpSpatialReusePass->execute(pRenderContext, { mParams.frameDim, 1u });
 }
 

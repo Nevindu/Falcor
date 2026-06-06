@@ -58,6 +58,20 @@ FALCOR_ENUM_INFO(MISHeuristic, {
 });
 FALCOR_ENUM_REGISTER(MISHeuristic);
 
+enum class SpatialMISStrategy : uint32_t
+{
+    Constant    = 0,    ///< Baseline reservoir merge using constant reuse MIS.
+    Generalized = 1,    ///< Generalized balance heuristic over accepted spatial proposal domains.
+    Pairwise    = 2,    ///< Pairwise MIS between the canonical proposal and each neighbor proposal.
+};
+
+FALCOR_ENUM_INFO(SpatialMISStrategy, {
+    { SpatialMISStrategy::Constant, "Constant" },
+    { SpatialMISStrategy::Generalized, "Generalized" },
+    { SpatialMISStrategy::Pairwise, "Pairwise" },
+});
+FALCOR_ENUM_REGISTER(SpatialMISStrategy);
+
 // Define tile sizes in pixels.
 // The frame is divided into tiles stored in scanline order, with pixels in tiles enumerated in Morton order.
 static const uint2 kScreenTileDim = { 16, 16 };     ///< Screen-tile dimension in pixels.
@@ -83,6 +97,8 @@ struct ReSTIRPTParams
     uint    fixedSeed = 1;              ///< The seed to use when 'useFixedSeed' is enabled.
     float   lodBias = 0.f;              ///< LOD bias applied to secondary hits.
     float   specularRoughnessThreshold = 0.25f; ///< Specular reflection events are only classified as specular if the material's roughness value is equal or smaller than this threshold. Otherwise they are classified diffuse.
+    float   minReconnectDistance = 1e-3f; ///< Minimum distance for path-space reconnection. Shorter shifts are rejected.
+    float   maxReconnectJacobian = 1e4f; ///< Maximum accepted reconnection Jacobian. Larger values are rejected, not clamped.
 
     // Runtime values
     uint2   frameDim = { 0, 0 };        ///< Frame dimension in pixels.

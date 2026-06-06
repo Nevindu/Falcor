@@ -43,7 +43,7 @@ static const uint kMissScatter = 0;
 
 struct PathPayload
 {
-    uint4 packed[6];
+    uint4 packed[12];
 
     PackedHitInfo hit;
     GuideData guideData;
@@ -71,6 +71,30 @@ struct PathPayload
 
         p.packed[5].x = asuint(path.risTarget);
         p.packed[5].y = asuint(path.risWeightSum);
+        p.packed[5].z = path.reusableLightIndex;
+        p.packed[5].w = path.reusableLightTriangleIndex;
+
+        p.packed[6].xyz = asuint(path.reusableLightPosW);
+        p.packed[6].w = path.reusableLightValid;
+
+        p.packed[7].xyz = asuint(path.reusableLightNormalW);
+        p.packed[7].w = path.reusableLightType;
+
+        p.packed[8].xyz = asuint(path.reusableLightLi);
+        p.packed[8].w = asuint(path.reusableLightDistance);
+
+        p.packed[9].xyz = asuint(path.reusableLightDir);
+        p.packed[9].w = path.reusableLightFlags;
+
+        p.packed[10].x = asuint(path.reusableLightPdf);
+        p.packed[10].y = asuint(path.reusableScatterPdf);
+        p.packed[10].z = path.risState;
+        p.packed[10].w = packPathRISMetadata(path.risCandidateCount, path.selectedCandidate, path.selectedKind, path.selectedVertex);
+
+        p.packed[11].x = path.pathSeed;
+        p.packed[11].y = path.reconnectVertex;
+        p.packed[11].z = path.scatterLobeTags0;
+        p.packed[11].w = path.scatterLobeTags1;
 
         p.hit = path.hit.pack();
         p.guideData = path.guideData;
@@ -102,6 +126,30 @@ struct PathPayload
 
         path.risTarget = asfloat(p.packed[5].x);
         path.risWeightSum = asfloat(p.packed[5].y);
+        path.reusableLightIndex = p.packed[5].z;
+        path.reusableLightTriangleIndex = p.packed[5].w;
+
+        path.reusableLightPosW = asfloat(p.packed[6].xyz);
+        path.reusableLightValid = p.packed[6].w;
+
+        path.reusableLightNormalW = asfloat(p.packed[7].xyz);
+        path.reusableLightType = p.packed[7].w;
+
+        path.reusableLightLi = asfloat(p.packed[8].xyz);
+        path.reusableLightDistance = asfloat(p.packed[8].w);
+
+        path.reusableLightDir = asfloat(p.packed[9].xyz);
+        path.reusableLightFlags = p.packed[9].w;
+
+        path.reusableLightPdf = asfloat(p.packed[10].x);
+        path.reusableScatterPdf = asfloat(p.packed[10].y);
+        path.risState = p.packed[10].z;
+        unpackPathRISMetadata(p.packed[10].w, path.risCandidateCount, path.selectedCandidate, path.selectedKind, path.selectedVertex);
+
+        path.pathSeed = p.packed[11].x;
+        path.reconnectVertex = p.packed[11].y;
+        path.scatterLobeTags0 = p.packed[11].z;
+        path.scatterLobeTags1 = p.packed[11].w;
 
         path.hit = unpackHitInfo(p.hit);
         path.guideData = p.guideData;
@@ -179,12 +227,13 @@ struct Scheduler
         path = PathPayload::unpack(payload);
     }
 
-    /** Traces a path and write result to output.
+    /** Traces a path and returns its initial path-tree reservoir.
         \param[in] pathID Path ID.
     */
-    void tracePath(uint pathID)
+    PathReservoir tracePath(uint pathID)
     {
         PathState path = {};
+        PathReservoir reservoir = {};
 
         gReSTIRPT.generatePath(pathID, path);
         gReSTIRPT.setupPathLogging(path);
@@ -197,9 +246,10 @@ struct Scheduler
         }
         else
         {
-            // Note the primary miss has already been handled by the separate path generation pass
-            // the path tracer runs first. Abort execution here to avoid double work.
-            return;
+            gReSTIRPT.handleMiss(path);
+            reservoir = gReSTIRPT.makeInitialReservoir(path);
+            gReSTIRPT.writeSampleOutputs(path, reservoir);
+            return reservoir;
         }
 
         // Trace path.
@@ -208,7 +258,9 @@ struct Scheduler
             nextHit(path);
         }
 
-        gReSTIRPT.writeOutput(path);
+        reservoir = gReSTIRPT.makeInitialReservoir(path);
+        gReSTIRPT.writeSampleOutputs(path, reservoir);
+        return reservoir;
     }
 
     /** Runs the path tracer for a single pixel.
@@ -218,14 +270,31 @@ struct Scheduler
     {
         // Determine number of samples to take.
         uint samplesRemaining = kSamplesPerPixel;
+        uint combineState = hashPathState((pixel.x | (pixel.y << 12)) ^ (gReSTIRPT.params.seed * 0x45d9f3bu));
+        PathReservoir selected = {};
+        float weightSum = 0.f;
+        uint candidateCount = 0u;
 
         // Loop over samples.
         while (samplesRemaining > 0)
         {
             samplesRemaining -= 1;
             uint pathID = pixel.x | (pixel.y << 12) | (samplesRemaining << 24);
-            tracePath(pathID);
+            PathReservoir candidate = tracePath(pathID);
+            const float candidateWeight = gReSTIRPT.getInitialReservoirCandidateWeight(candidate);
+            if (candidateWeight <= 0.f) continue;
+
+            candidateCount++;
+            const float newWeightSum = weightSum + candidateWeight;
+            if (sampleNextRIS(combineState) * newWeightSum < candidateWeight)
+            {
+                selected = candidate;
+            }
+            weightSum = newWeightSum;
         }
+
+        selected = gReSTIRPT.finalizeInitialReservoir(selected, weightSum, candidateCount);
+        gReSTIRPT.writeReservoirOutput(pixel, selected);
     }
 }
 

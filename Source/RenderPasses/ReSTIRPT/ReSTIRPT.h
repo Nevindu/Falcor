@@ -176,6 +176,7 @@ private:
     uint32_t                        mSpatialNeighborCount = 3;  ///< Number of spatial neighbors to test.
     uint32_t                        mSpatialRadius = 20;        ///< Spatial neighbor radius in pixels.
     uint32_t                        mSpatialIterations = 1;     ///< Number of spatial reuse iterations. Currently clamped to one.
+    SpatialMISStrategy              mSpatialMISStrategy = SpatialMISStrategy::Constant; ///< MIS strategy used while merging spatial reservoirs.
 
     ref<ComputePass>                mpGeneratePaths;            ///< Fullscreen compute pass generating paths starting at primary hits.
     ref<ComputePass>                mpSpatialReusePass;         ///< Spatial reservoir reuse pass.
