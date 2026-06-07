@@ -12,6 +12,11 @@ import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Sampling.TinyUniformSampleGenerator;
 
+// Per-sub-shift enables (production default: both on). Flip one off only to bisect which
+// reconnection sub-shift a bias originates from -- turning either off changes render output.
+static const bool kEnableDirectNEEShift = true;
+static const bool kEnableReplayShift = true;
+
 /** Fixed-x2 pure reconnection shift entry point.
 
     This file owns the terminal and replay reconnection implementation for the
@@ -705,20 +710,19 @@ extension ReSTIRPT
                     safeColorRatio(shiftedFirstFactor, sourceFirstFactor) *
                     safeColorRatio(shiftedX2Factor, sourceX2Factor) *
                     selectedRatio;
-                float3 finalShiftedContribution = shiftedContribution;
-                if (selectedIsBSDFTerminal)
+
+                // candidate.sample.contribution is an estimator value carrying the SOURCE primary/x2
+                // BSDF sampling pdfs. Move the forward pdf ratios into the jacobian so target*jacobian
+                // stays in the same solid-angle measure the resampling-MIS uses for every shift.
+                // Omitting it for NEE leaves a geometry-only jacobian whose cross-domain density
+                // (rcp(jacobian)*source.target in getPairwiseMISWeight) does not cancel the source
+                // primary pdf -> the partition over-counts. x2 ratio is 1 for selectedVertex==2.
+                if (sourceFirstPdf <= 0.f || shiftedFirstPdf <= 0.f || sourceX2Pdf <= 0.f || shiftedX2Pdf <= 0.f)
                 {
-                    if (sourceFirstPdf <= 0.f || shiftedFirstPdf <= 0.f || sourceX2Pdf <= 0.f || shiftedX2Pdf <= 0.f)
-                    {
-                        result.rejectionReason = 13u;
-                        return result;
-                    }
-                    // Terminal BSDF samples use an estimator-contribution
-                    // convention: contribution carries reciprocal sampling PDFs.
-                    // Keep the corresponding forward PDF ratios in jacobian so
-                    // shiftedTarget * jacobian stays in the fixed-x2 shift measure.
-                    finalShiftedContribution *= (sourceFirstPdf / shiftedFirstPdf) * (sourceX2Pdf / shiftedX2Pdf);
+                    result.rejectionReason = 13u;
+                    return result;
                 }
+                const float3 finalShiftedContribution = shiftedContribution * (sourceFirstPdf / shiftedFirstPdf) * (sourceX2Pdf / shiftedX2Pdf);
                 const float shiftedTarget = max(0.f, luminance(finalShiftedContribution));
                 if (shiftedTarget <= 0.f)
                 {
@@ -727,12 +731,7 @@ extension ReSTIRPT
                 }
 
                 const float jacobian = computeVertexReconnectJacobian(sourcePrimaryPosW, dstSd.posW, reconnectPosW, reconnectNormalW);
-                float finalJacobian = jacobian;
-                if (selectedIsBSDFTerminal)
-                {
-                    // Paired with the reciprocal contribution-side PDF ratios.
-                    finalJacobian *= (shiftedFirstPdf / sourceFirstPdf) * (shiftedX2Pdf / sourceX2Pdf);
-                }
+                const float finalJacobian = jacobian * (shiftedFirstPdf / sourceFirstPdf) * (shiftedX2Pdf / sourceX2Pdf);
                 if (finalJacobian <= 0.f || isnan(finalJacobian) || isinf(finalJacobian) || finalJacobian > params.maxReconnectJacobian)
                 {
                     result.rejectionReason = 13u;
@@ -960,9 +959,129 @@ extension ReSTIRPT
         return result;
     }
 
+    /** Reconnect a single-bounce direct NEE sample to the destination primary surface.
+
+        The selected candidate sampled a light directly from the source primary vertex x1. The shift
+        reuses the SAME light sample's irradiance (Le / sourceLightPdf) and re-evaluates the BSDF, MIS,
+        and visibility for the new edge y1 -> light at the destination primary.
+
+        Measure convention (shared with the other reconnection shifts): the contribution keeps the
+        SOURCE light-sampling pdf (the stored irradiance is not re-divided by a destination pdf), and
+        the Jacobian is the geometric reconnection determinant of the light edge,
+        computeTerminalReconnectGeometryJacobian = (cos_dst/cos_src) * (dist_src^2/dist_dst^2) -- the
+        same solid-angle measure getPairwiseMISWeight assumes. A unit Jacobian would be internally
+        consistent for an area-measure target but inconsistent with the geometry-based Jacobians of the
+        other shifts, breaking the MIS partition. shiftedTarget * jacobian is the destination NEE
+        estimator either way.
+    */
+    ShiftMappingResult evaluateDirectNEECandidate(PathReservoir candidate, ShadingData dstSd, HitInfo dstHit, uint2 dstPixel)
+    {
+        ShiftMappingResult result = {};
+        result.originalTarget = candidate.target;
+
+        const PathSample sample = candidate.sample;
+        if ((sample.flags & kPathSampleFlagCanReconnectDirectNEE) == 0u ||
+            sample.reusableLightValid == 0u ||
+            sample.selectedKind != kPathSampleKindNEE ||
+            sample.selectedVertex != 1u ||
+            sample.reusableLightPdf <= 0.f)
+        {
+            result.rejectionReason = 8u;
+            return result;
+        }
+
+        // Destination primary roughness gate (symmetric with the source primaryRoughHit gate). A
+        // near-specular destination cannot realize the reconnected NEE edge with meaningful support.
+        let lod = ExplicitLodTextureSampler(0.f);
+        let hints = getMaterialInstanceHints(dstHit, true);
+        const IMaterialInstance mi = gScene.materials.getMaterialInstance(dstSd, lod, hints);
+        const BSDFProperties dstBsdfProperties = mi.getProperties(dstSd);
+        if (dstBsdfProperties.roughness <= params.specularRoughnessThreshold)
+        {
+            result.rejectionReason = 14u;
+            return result;
+        }
+
+        // Recover the destination edge geometry (direction/distance/visibility-ray origin) and validate
+        // light-facing/hemisphere support at the destination. The dest-pdf lightFactor it returns is
+        // discarded: this shift reuses the SOURCE light-sampling pdf (see measure convention above).
+        float3 origin;
+        float3 dir;
+        float distance;
+        float3 lightFactorDst;
+        float lightPdfDst;
+        if (!evaluateStoredLightGeometryAtVertex(sample, dstSd, origin, dir, distance, lightFactorDst, lightPdfDst, result.rejectionReason))
+            return result;
+
+        // Geometric reconnection Jacobian for the reused light edge (unit for env/directional). Paired
+        // with the source-pdf irradiance below, shiftedTarget * jacobian equals the destination NEE
+        // estimator while staying in the same measure as the other shifts.
+        const float jacobian = computeTerminalReconnectGeometryJacobian(sample, dstSd);
+        if (jacobian <= 0.f || isnan(jacobian) || isinf(jacobian) || jacobian > params.maxReconnectJacobian)
+        {
+            result.rejectionReason = 13u;
+            return result;
+        }
+
+        // Reuse the source light sample's irradiance Le / sourceLightPdf (reusableLightLi is the pre-MIS
+        // radiance Le), re-deriving the NEE MIS weight with the destination scatter pdf. Unlike
+        // evaluateStoredNEEAtVertex, which re-divides by the DESTINATION light pdf, keeping the SOURCE pdf
+        // here is what carries the cross-domain density into the Jacobian.
+        TinyUniformSampleGenerator sg = TinyUniformSampleGenerator(dstPixel, params.frameCount);
+        const float dstScatterPdf = mi.evalPdf(dstSd, dir, kUseBSDFSampling);
+        float3 lightFactor = sample.reusableLightLi / sample.reusableLightPdf;
+        if ((sample.reusableLightFlags & kReusableLightFlagUseMIS) != 0u)
+        {
+            lightFactor *= evalMIS(1.f, sample.reusableLightPdf, 1.f, dstScatterPdf);
+        }
+
+        const float3 shiftedContribution = mi.eval(dstSd, dir, sg) * lightFactor;
+        const float shiftedTarget = max(0.f, luminance(shiftedContribution));
+        if (shiftedTarget <= 0.f)
+        {
+            result.rejectionReason = 10u;
+            return result;
+        }
+
+        // Visibility from the destination primary surface to the stored light sample. Unlike the replay
+        // helpers this destination edge is new and its occlusion is independent of the source path.
+        SceneRayQuery<kUseAlphaTest> rayQuery;
+        const Ray ray = Ray(origin, dir, 0.f, distance);
+        if (!rayQuery.traceVisibilityRay(ray))
+        {
+            result.rejectionReason = 11u;
+            return result;
+        }
+
+        // Copy the whole sample so the routing fields (CanReconnectDirectNEE, selectedKind/Vertex,
+        // reusableLight*) survive: the spatial reverse (center->neighbor) shift re-dispatches on them and
+        // must land back in this sub-shift for the forward/reverse pair to stay invertible.
+        PathSample shiftedSample = sample;
+        shiftedSample.contribution = shiftedContribution;
+        shiftedSample.target = shiftedTarget;
+        shiftedSample.reusableScatterPdf = dstScatterPdf;
+        shiftedSample.reusableLightDistance = distance;
+
+        result.valid = true;
+        result.shiftedContribution = shiftedContribution;
+        result.shiftedSample = shiftedSample;
+        result.shiftedTarget = shiftedTarget;
+        result.targetRatio = candidate.target > 0.f ? shiftedTarget / candidate.target : 0.f;
+        result.jacobian = jacobian;
+        result.rejectionReason = 0u;
+        return result;
+    }
+
     ShiftMappingResult applyReconnectionShift(PathReservoir source, ShadingData dstSd, HitInfo dstHit, uint2 dstPixel)
     {
-        if ((source.sample.flags & kPathSampleFlagNeedsReplay) != 0u)
+        // Routed to the first matching sub-shift. Direct-NEE (NEE at vertex 1) and replay (NeedsReplay,
+        // vertex >= 2) are disjoint by selectedVertex; the terminal-BSDF branch takes the remaining
+        // hitLight/env terminals. Replay is checked before terminal so a hitLight that needs a replayed
+        // prefix is not mis-routed to the plain terminal shift.
+        if (kEnableDirectNEEShift && (source.sample.flags & kPathSampleFlagCanReconnectDirectNEE) != 0u)
+            return evaluateDirectNEECandidate(source, dstSd, dstHit, dstPixel);
+
+        if (kEnableReplayShift && (source.sample.flags & kPathSampleFlagNeedsReplay) != 0u)
             return evaluateReplayReconnection(source, dstSd, dstHit, dstPixel);
 
         if (source.sample.selectedKind == kPathSampleKindHitLight || source.sample.selectedKind == kPathSampleKindEnv)

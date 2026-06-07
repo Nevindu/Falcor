@@ -638,6 +638,15 @@ struct ReSTIRPT
         {
             sample.flags |= kPathSampleFlagNeedsReplay;
         }
+        // Single-bounce direct NEE (light sampled straight from the primary surface) is the dominant
+        // lighting signal but has no x2/replay reconnection target. Mark it for the dedicated direct-NEE
+        // reconnection shift, which reuses the same light sample at the destination primary surface. The
+        // gate is stored on the source sample and re-evaluated by the spatial reverse shift, so it must be
+        // a source-symmetric SURFACE predicate (isPrimaryRough, not the sampled lobe) to stay invertible.
+        if (path.reusableLightValid != 0u && path.selectedKind == kPathSampleKindNEE && path.selectedVertex == 1u && path.isPrimaryRough())
+        {
+            sample.flags |= kPathSampleFlagCanReconnectDirectNEE;
+        }
         sample.rngState = path.pathSeed;
         sample.target = path.risTarget;
         sample.contribution = path.L;
@@ -1307,6 +1316,10 @@ struct ReSTIRPT
 
         // Disable specular lobes if caustics are disabled and path already contains a diffuse vertex.
         bool isSpecular = bsdfProperties.roughness <= params.specularRoughnessThreshold;
+        // Record whether the primary surface is rough. The direct-NEE reconnection shift gates on the
+        // SURFACE roughness (not the sampled onward lobe) so the source and destination acceptance tests
+        // use the same predicate and the shift stays symmetric.
+        if (isPrimaryHit && !isSpecular) path.setPrimaryRoughHit();
         if (kDisableCaustics && path.getBounces(BounceType::Diffuse) > 0 && isSpecular)
         {
             sd.mtl.setActiveLobes((uint)LobeType::Diffuse);

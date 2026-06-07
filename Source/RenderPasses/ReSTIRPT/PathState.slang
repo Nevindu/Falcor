@@ -40,6 +40,7 @@ static const uint kPathSampleFlagValid = 1u << 0;             ///< Sample carrie
 static const uint kPathSampleFlagCanReconnectAtX2 = 1u << 1;  ///< Sample can be shifted by replacing x1 with the destination primary hit and reconnecting to x2.
 static const uint kPathSampleFlagNeedsReplay = 1u << 2;       ///< Sample requires source path replay/tail evaluation before the fixed-x2 reconnection shift.
 static const uint kPathSampleFlagAlreadyShifted = 1u << 3;    ///< Sample has already been shifted into another primary domain; replayed suffix imports must not replay it as canonical.
+static const uint kPathSampleFlagCanReconnectDirectNEE = 1u << 4; ///< Single-bounce direct NEE at the primary vertex: shiftable by reconnecting the same light sample to the destination primary surface.
 
 static const uint kPathSampleKindInvalid = 0u;
 static const uint kPathSampleKindHitLight = 1u;               ///< BSDF-sampled hit on an emissive surface.
@@ -140,6 +141,8 @@ enum class PathFlags
     deltaTransmissionPath       = 0x0800,   ///< Path started with and followed delta transmission events (whenever possible - TIR could be an exception) until it hit the first non-delta event.
     deltaOnlyPath               = 0x1000,   ///< There was no non-delta events along the path so far.
 
+    primaryRoughHit             = 0x2000,   ///< Primary surface is rough (roughness > specularRoughnessThreshold). Used to gate the direct-NEE reconnection shift symmetrically.
+
     // Bits 14 to kPathFlagsBitCount are still unused.
 };
 
@@ -226,6 +229,7 @@ struct PathState
     bool isDeltaReflectionPrimaryHit() { return hasFlag(PathFlags::deltaReflectionPrimaryHit); }
     bool isDeltaTransmissionPath() { return hasFlag(PathFlags::deltaTransmissionPath); }
     bool isDeltaOnlyPath() { return hasFlag(PathFlags::deltaOnlyPath); }
+    bool isPrimaryRough() { return hasFlag(PathFlags::primaryRoughHit); }
 
     // Check if the scatter event is samplable by the light sampling technique.
     bool isLightSamplable() { return !isDelta(); }
@@ -251,6 +255,7 @@ struct PathState
     [mutating] void setDeltaReflectionPrimaryHit(bool value = true) { setFlag(PathFlags::deltaReflectionPrimaryHit, value); }
     [mutating] void setDeltaTransmissionPath(bool value = true) { setFlag(PathFlags::deltaTransmissionPath, value); }
     [mutating] void setDeltaOnlyPath(bool value = true) { setFlag(PathFlags::deltaOnlyPath, value); }
+    [mutating] void setPrimaryRoughHit(bool value = true) { setFlag(PathFlags::primaryRoughHit, value); }
 
     bool hasFlag(PathFlags flag)
     {
