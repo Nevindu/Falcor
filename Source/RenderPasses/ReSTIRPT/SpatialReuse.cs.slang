@@ -526,7 +526,6 @@ struct SpatialReusePass
         proposalAccepted[proposalCount] = 0u;
         if (evaluateIdentityCandidate(selected, selfShifted, selfShiftRejection))
         {
-            candidateCount += getProposalConfidence(selected);
             shiftedCandidates[proposalCount] = selfShifted;
             proposalAccepted[proposalCount] = 1u;
             candidateCount += getProposalConfidence(selected);
@@ -636,30 +635,6 @@ struct SpatialReusePass
                 lastRejectionReason = forwardValid ? 16u : shiftRejectionReason;
                 rejected++;
             }
-        }
-
-        {
-            uint compactCount = 0u;
-            uint compactCandidateCount = 0u;
-            for (uint i = 0u; i < proposalCount; i++)
-            {
-                if (proposalAccepted[i] == 0u) continue;
-
-                if (compactCount != i)
-                {
-                    proposalReservoirs[compactCount] = proposalReservoirs[i];
-                    shiftedCandidates[compactCount] = shiftedCandidates[i];
-                    proposalPixels[compactCount] = proposalPixels[i];
-                    proposalDistances[compactCount] = proposalDistances[i];
-                    proposalAccepted[compactCount] = proposalAccepted[i];
-                }
-
-                compactCandidateCount += getProposalConfidence(proposalReservoirs[compactCount]);
-                compactCount++;
-            }
-
-            proposalCount = compactCount;
-            candidateCount = compactCandidateCount;
         }
 
         for (uint i = 0u; i < proposalCount; i++)
