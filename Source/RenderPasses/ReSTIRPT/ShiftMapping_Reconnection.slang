@@ -428,19 +428,37 @@ extension ReSTIRPT
             }
 
             const LightData light = gScene.getLight(sample.reusableLightIndex);
-            lightPdf = selectionPdf / float(lightCount);
-            if (lightPdf <= 0.f)
+            const float lightSelectionPdf = selectionPdf / float(lightCount);
+            if (lightSelectionPdf <= 0.f)
             {
                 rejectionReason = 9u;
                 return false;
             }
 
-            if (light.type == LightType::Directional || light.type == LightType::Distant)
+            if (light.type == LightType::Directional)
             {
                 dir = normalize(sample.reusableLightDir);
                 origin = sd.computeRayOrigin();
                 distance = kRayTMax;
-                lightFactor = light.intensity / lightPdf;
+                lightPdf = lightSelectionPdf;
+                lightFactor = light.intensity / lightSelectionPdf;
+                return any(lightFactor > 0.f);
+            }
+
+            if (light.type == LightType::Distant)
+            {
+                const float solidAngle = 6.28318530718f * (1.f - light.cosSubtendedAngle);
+                if (solidAngle <= 0.f)
+                {
+                    rejectionReason = 9u;
+                    return false;
+                }
+
+                dir = normalize(sample.reusableLightDir);
+                origin = sd.computeRayOrigin();
+                distance = kRayTMax;
+                lightPdf = lightSelectionPdf / solidAngle;
+                lightFactor = light.intensity / lightSelectionPdf;
                 return any(lightFactor > 0.f);
             }
 
@@ -460,7 +478,8 @@ extension ReSTIRPT
                     const float deltaAngle = light.openingAngle - acos(cosTheta);
                     falloff = smoothstep(0.f, light.penumbraAngle, deltaAngle);
                 }
-                lightFactor = light.intensity * falloff / distSqr / lightPdf;
+                lightPdf = lightSelectionPdf;
+                lightFactor = light.intensity * falloff / distSqr / lightSelectionPdf;
                 return any(lightFactor > 0.f);
             }
 
@@ -472,7 +491,15 @@ extension ReSTIRPT
                     rejectionReason = 9u;
                     return false;
                 }
-                lightFactor = light.intensity * (light.surfaceArea * cosLight / distSqr) / lightPdf;
+                const float localLightPdf = distSqr / (cosLight * light.surfaceArea);
+                lightPdf = lightSelectionPdf * localLightPdf;
+                if (lightPdf <= 0.f)
+                {
+                    rejectionReason = 9u;
+                    return false;
+                }
+
+                lightFactor = light.intensity / lightPdf;
                 return any(lightFactor > 0.f);
             }
 #endif
