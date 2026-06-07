@@ -43,5 +43,6 @@ StructuredBuffer<GuideData> sampleGuideData;
 StructuredBuffer<PathReservoir> currentReservoirs;
 StructuredBuffer<PathReservoir> spatialReservoirs;
 StructuredBuffer<PathReservoir> previousReservoirs;
+StructuredBuffer<HybridReconnectionData> hybridReconnectionData;
 
 void main() {}

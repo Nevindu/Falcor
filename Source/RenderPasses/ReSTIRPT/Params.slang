@@ -76,7 +76,7 @@ enum class ShiftMapping : uint32_t
 {
     Reconnection = 0,  ///< Fixed-x2 reconnection shift.
     RandomReplay = 1,  ///< Random replay shift scaffold. Currently falls back to identity.
-    Hybrid       = 2,  ///< Hybrid replay + reconnection shift scaffold. Currently falls back to identity.
+    Hybrid       = 2,  ///< Hybrid replay + reconnection shift.
 };
 
 FALCOR_ENUM_INFO(ShiftMapping, {
@@ -85,6 +85,20 @@ FALCOR_ENUM_INFO(ShiftMapping, {
     { ShiftMapping::Hybrid, "Hybrid" },
 });
 FALCOR_ENUM_REGISTER(ShiftMapping);
+
+enum class HybridShiftMode : uint32_t
+{
+    FixedX2              = 0,  ///< Stage A: fixed-x2 reconnection only.
+    K3ReplayPrefix      = 1,  ///< Prepared hybrid replay-prefix shift only; rejected samples stay rejected.
+    K3ReplayWithFallback = 2, ///< Prepared hybrid replay-prefix shift with fixed-x2 fallback when hybrid rejects.
+};
+
+FALCOR_ENUM_INFO(HybridShiftMode, {
+    { HybridShiftMode::FixedX2, "Fixed x2" },
+    { HybridShiftMode::K3ReplayPrefix, "Hybrid replay prefix" },
+    { HybridShiftMode::K3ReplayWithFallback, "Hybrid replay + x2 fallback" },
+});
+FALCOR_ENUM_REGISTER(HybridShiftMode);
 
 // Define tile sizes in pixels.
 // The frame is divided into tiles stored in scanline order, with pixels in tiles enumerated in Morton order.
@@ -114,7 +128,7 @@ struct ReSTIRPTParams
     float   minReconnectDistance = 1e-3f; ///< Minimum distance for path-space reconnection. Shorter shifts are rejected.
     float   maxReconnectJacobian = 1e4f; ///< Maximum accepted reconnection Jacobian. Larger values are rejected, not clamped.
     uint    shiftMapping = uint(ShiftMapping::Reconnection); ///< Runtime-selected shift mapping for spatial/future temporal reuse.
-    uint    _padShiftMapping = 0;
+    uint    hybridShiftMode = uint(HybridShiftMode::K3ReplayWithFallback); ///< Hybrid implementation stage/mode.
 
     // Runtime values
     uint2   frameDim = { 0, 0 };        ///< Frame dimension in pixels.

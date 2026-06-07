@@ -23,6 +23,14 @@ use_spatial_reuse = globals().get("RESTIRPT_USE_SPATIAL_REUSE", False)
 spatial_neighbor_count = globals().get("RESTIRPT_SPATIAL_NEIGHBOR_COUNT", 3)
 spatial_radius = globals().get("RESTIRPT_SPATIAL_RADIUS", 20)
 spatial_iterations = globals().get("RESTIRPT_SPATIAL_ITERATIONS", 1)
+shift_mapping = globals().get("RESTIRPT_SHIFT_MAPPING", None)
+hybrid_shift_mode = globals().get("RESTIRPT_HYBRID_SHIFT_MODE", None)
+requested_enable_prepared_hybrid_k3 = globals().get("RESTIRPT_ENABLE_PREPARED_HYBRID_K3", None)
+effective_prepared_hybrid = bool(
+    use_spatial_reuse
+    and shift_mapping == 2
+    and (hybrid_shift_mode is None or hybrid_shift_mode != 0)
+)
 
 
 def _make_graph(name, pass_name, pass_props):
@@ -86,6 +94,10 @@ def _graph_spec():
             "spatialRadius": spatial_radius,
             "spatialIterations": spatial_iterations,
         }
+        if shift_mapping is not None:
+            props["shiftMapping"] = shift_mapping
+        if hybrid_shift_mode is not None:
+            props["hybridShiftMode"] = hybrid_shift_mode
         return (
             "ReSTIRPT",
             _make_graph("ReSTIRPT", "ReSTIRPT", props),
@@ -109,6 +121,8 @@ print(
     )
 )
 print("Saving capture to: {}".format(output_dir))
+if requested_enable_prepared_hybrid_k3 is not None:
+    print("RESTIRPT_ENABLE_PREPARED_HYBRID_K3 is deprecated; prepared hybrid is now automatic for non-fixed Hybrid modes.")
 
 try:
     m.frameCapture.outputDir = output_dir
@@ -144,6 +158,10 @@ summary = {
     "spatialNeighborCount": spatial_neighbor_count,
     "spatialRadius": spatial_radius,
     "spatialIterations": spatial_iterations,
+    "shiftMapping": shift_mapping,
+    "hybridShiftMode": hybrid_shift_mode,
+    "effectivePreparedHybrid": effective_prepared_hybrid,
+    "requestedEnablePreparedHybridK3": requested_enable_prepared_hybrid_k3,
     "nrdDenoising": False,
     "pathTracerUseNRDDemodulation": path_tracer_use_nrd_demodulation,
     "effectivePathTracerSamples": samples_per_pixel * (frames + 1),

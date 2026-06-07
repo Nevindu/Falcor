@@ -40,6 +40,7 @@ static const uint kPathSampleFlagValid = 1u << 0;             ///< Sample carrie
 static const uint kPathSampleFlagCanReconnectAtX2 = 1u << 1;  ///< Sample can be shifted by replacing x1 with the destination primary hit and reconnecting to x2.
 static const uint kPathSampleFlagNeedsReplay = 1u << 2;       ///< Sample requires source path replay/tail evaluation before the fixed-x2 reconnection shift.
 static const uint kPathSampleFlagAlreadyShifted = 1u << 3;    ///< Sample has already been shifted into another primary domain; replayed suffix imports must not replay it as canonical.
+static const uint kPathSampleFlagHybridK3 = 1u << 4;          ///< Sample may use the prepared hybrid replay-prefix shift.
 
 static const uint kPathSampleKindInvalid = 0u;
 static const uint kPathSampleKindHitLight = 1u;               ///< BSDF-sampled hit on an emissive surface.
@@ -48,6 +49,17 @@ static const uint kPathSampleKindEnv = 3u;                    ///< BSDF-sampled 
 
 static const uint kInvalidReconnectVertex = 0u;
 static const uint kMaxStoredReplayLobes = 8u;                 ///< One 8-bit sampled lobe tag for scatter vertices 1..8.
+static const uint kMaxHybridSpatialNeighbors = 3u;            ///< Reference-style real-time hybrid retrace storage budget.
+static const uint kExtendedPathLobeAll = 0xffu;               ///< Slide-deck N_lobe marker: the technique evaluates all compatible lobes.
+static const uint kExtendedPathTechniqueInvalid = kPathSampleKindInvalid;
+static const uint kExtendedPathTechniqueBSDFHitLight = kPathSampleKindHitLight;
+static const uint kExtendedPathTechniqueNEE = kPathSampleKindNEE;
+static const uint kExtendedPathTechniqueBSDFEnv = kPathSampleKindEnv;
+
+static const uint kHybridReconnectionDataFlagValid = 1u << 0;
+static const uint kHybridReconnectionDataReasonMask = 0xffu;
+static const uint kHybridCachedShiftFlagValid = 1u << 0;
+static const uint kHybridCachedShiftReasonMask = 0xffu;
 
 uint hashPathState(uint v)
 {
@@ -70,19 +82,19 @@ float sampleNextRIS(inout uint state)
     return float(state & 0x00ffffffu) / float(0x01000000u);
 }
 
-void setReplayLobeTag(inout uint tags0, inout uint tags1, uint vertex, uint lobeType)
+void setPackedExtendedPathTag(inout uint tags0, inout uint tags1, uint vertex, uint tag)
 {
     if (vertex == 0u || vertex > kMaxStoredReplayLobes) return;
 
     const uint byteIndex = vertex - 1u;
     const uint shift = (byteIndex & 3u) << 3;
     const uint mask = 0xffu << shift;
-    const uint value = (lobeType & 0xffu) << shift;
+    const uint value = (tag & 0xffu) << shift;
     if (byteIndex < 4u) tags0 = (tags0 & ~mask) | value;
     else tags1 = (tags1 & ~mask) | value;
 }
 
-uint getReplayLobeTag(uint tags0, uint tags1, uint vertex)
+uint getPackedExtendedPathTag(uint tags0, uint tags1, uint vertex)
 {
     if (vertex == 0u || vertex > kMaxStoredReplayLobes) return 0u;
 
@@ -91,9 +103,56 @@ uint getReplayLobeTag(uint tags0, uint tags1, uint vertex)
     return byteIndex < 4u ? ((tags0 >> shift) & 0xffu) : ((tags1 >> shift) & 0xffu);
 }
 
+void setReplayLobeTag(inout uint tags0, inout uint tags1, uint vertex, uint lobeType)
+{
+    setPackedExtendedPathTag(tags0, tags1, vertex, lobeType);
+}
+
+uint getReplayLobeTag(uint tags0, uint tags1, uint vertex)
+{
+    return getPackedExtendedPathTag(tags0, tags1, vertex);
+}
+
 bool hasReplayLobeTag(uint tags0, uint tags1, uint vertex)
 {
     return getReplayLobeTag(tags0, tags1, vertex) != 0u;
+}
+
+uint getExtendedPathTechniqueTagForSampleKind(uint sampleKind)
+{
+    switch (sampleKind)
+    {
+    case kPathSampleKindHitLight:
+        return kExtendedPathTechniqueBSDFHitLight;
+    case kPathSampleKindNEE:
+        return kExtendedPathTechniqueNEE;
+    case kPathSampleKindEnv:
+        return kExtendedPathTechniqueBSDFEnv;
+    default:
+        break;
+    }
+
+    return kExtendedPathTechniqueInvalid;
+}
+
+void setExtendedPathTechniqueTag(inout uint tags0, inout uint tags1, uint vertex, uint techniqueTag)
+{
+    setPackedExtendedPathTag(tags0, tags1, vertex, techniqueTag);
+}
+
+uint getExtendedPathTechniqueTag(uint tags0, uint tags1, uint vertex)
+{
+    return getPackedExtendedPathTag(tags0, tags1, vertex);
+}
+
+void setExtendedPathNEELobeTag(inout uint tags0, inout uint tags1, uint vertex, uint lobeTag)
+{
+    setPackedExtendedPathTag(tags0, tags1, vertex, lobeTag);
+}
+
+uint getExtendedPathNEELobeTag(uint tags0, uint tags1, uint vertex)
+{
+    return getPackedExtendedPathTag(tags0, tags1, vertex);
 }
 
 uint packPathRISMetadata(uint risCandidateCount, uint selectedCandidate, uint selectedKind, uint selectedVertex)
@@ -164,7 +223,7 @@ struct PathState
     uint        selectedCandidate;      ///< Index of the candidate selected by initial RIS.
     uint        selectedKind;           ///< kPathSampleKind* value for the selected candidate.
     uint        selectedVertex;         ///< Path vertex at which the selected candidate was generated.
-    uint        reconnectVertex;        ///< Fixed pure-reconnection suffix vertex. Currently 2 for reusable x2 tails, or kInvalidReconnectVertex.
+    uint        reconnectVertex;        ///< Hybrid/reconnection suffix vertex k. 2 is fixed reconnection; k > 2 enables replay-prefix hybrid.
     uint        scatterLobeTags0;       ///< Packed sampled BSDF lobe tags for replay scatter vertices 1..4.
     uint        scatterLobeTags1;       ///< Packed sampled BSDF lobe tags for replay scatter vertices 5..8.
 
@@ -324,7 +383,7 @@ struct PathSample
     uint        risCandidateCount;       ///< Number of positive path-tree RIS candidates in the source path.
     uint        selectedKind;            ///< kPathSampleKind* value for the selected candidate.
     uint        selectedVertex;          ///< Source path vertex where the selected event was generated.
-    uint        reconnectVertex;         ///< Fixed pure-reconnection suffix vertex. Currently 2 for reusable x2 tails, or kInvalidReconnectVertex.
+    uint        reconnectVertex;         ///< Hybrid/reconnection suffix vertex k. 2 is fixed reconnection; k > 2 enables replay-prefix hybrid.
     uint        scatterLobeTags0;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 1..4.
     uint        scatterLobeTags1;        ///< Packed sampled BSDF lobe tags for replay scatter vertices 5..8.
     uint        techniqueTags0;          ///< Reserved packed per-vertex technique tags for future random replay/hybrid shifts.
@@ -372,6 +431,88 @@ struct PathReservoir
     float      selectedDistance;         ///< Distance to the selected spatial neighbor for diagnostics.
 };
 
+/** Destination-prefix data produced by the spatial hybrid retrace pass.
+
+    The source reservoir owns the source suffix and the source-side reconnection
+    data. This record owns only the destination random-replay prefix endpoint:
+    y_{k-1}, the local outgoing/view direction there, and the replay prefix
+    throughput. Fixed-x2 hybrid does not need this payload, but keeping it in the
+    shift interface makes the deeper hybrid path match the GRIS reference shape.
+*/
+struct HybridReconnectionData
+{
+    PackedHitInfo rcPrevHit;             ///< Packed destination predecessor y_{k-1}; invalid for rejected replay.
+    float3        rcPrevOrigin;          ///< Parent ray origin used to load y_{k-1} shading data.
+    float3        rcPrevWo;              ///< Ray direction from the destination predecessor's parent into y_{k-1}.
+    float3        prefixThroughput;      ///< Random-replay prefix throughput. Replay jacobian is one in PSS.
+    uint          metadata;              ///< Bit 0 valid, bits 8..15 rejection reason, bits 16..23 source reconnect vertex.
+    float3        cachedShiftedContribution; ///< Cached destination-domain contribution for prepared hybrid shifts.
+    float         cachedShiftedTarget;    ///< Cached destination-domain target p-hat for prepared hybrid shifts.
+    float         cachedTargetRatio;      ///< Cached shifted/source target ratio.
+    float         cachedJacobian;         ///< Cached shift Jacobian.
+    float         cachedReusableScatterPdf; ///< Cached destination-side reusable scatter PDF.
+    uint          cachedShiftMetadata;    ///< Bit 0 valid, bits 8..15 rejection reason.
+};
+
+uint packHybridReconnectionMetadata(uint valid, uint rejectionReason, uint reconnectVertex)
+{
+    return (valid & 1u) |
+           ((rejectionReason & kHybridReconnectionDataReasonMask) << 8) |
+           ((reconnectVertex & 0xffu) << 16);
+}
+
+uint packHybridCachedShiftMetadata(uint valid, uint rejectionReason)
+{
+    return (valid & 1u) |
+           ((rejectionReason & kHybridCachedShiftReasonMask) << 8);
+}
+
+bool isHybridReconnectionDataValid(HybridReconnectionData data)
+{
+    return (data.metadata & kHybridReconnectionDataFlagValid) != 0u;
+}
+
+uint getHybridReconnectionDataReason(HybridReconnectionData data)
+{
+    return (data.metadata >> 8) & kHybridReconnectionDataReasonMask;
+}
+
+uint getHybridReconnectionDataVertex(HybridReconnectionData data)
+{
+    return (data.metadata >> 16) & 0xffu;
+}
+
+bool isHybridCachedShiftValid(HybridReconnectionData data)
+{
+    return (data.cachedShiftMetadata & kHybridCachedShiftFlagValid) != 0u;
+}
+
+uint getHybridCachedShiftReason(HybridReconnectionData data)
+{
+    return (data.cachedShiftMetadata >> 8) & kHybridCachedShiftReasonMask;
+}
+
+HybridReconnectionData makeInvalidHybridReconnectionData(uint rejectionReason, uint reconnectVertex = kInvalidReconnectVertex)
+{
+    HybridReconnectionData data = {};
+    data.prefixThroughput = float3(0.f);
+    data.metadata = packHybridReconnectionMetadata(0u, rejectionReason, reconnectVertex);
+    data.cachedShiftMetadata = packHybridCachedShiftMetadata(0u, rejectionReason);
+    return data;
+}
+
+HybridReconnectionData makeValidHybridReconnectionData(PackedHitInfo rcPrevHit, float3 rcPrevWo, float3 prefixThroughput, uint reconnectVertex, float3 rcPrevOrigin = float3(0.f))
+{
+    HybridReconnectionData data = {};
+    data.rcPrevHit = rcPrevHit;
+    data.rcPrevOrigin = rcPrevOrigin;
+    data.rcPrevWo = rcPrevWo;
+    data.prefixThroughput = prefixThroughput;
+    data.metadata = packHybridReconnectionMetadata(1u, 0u, reconnectVertex);
+    data.cachedShiftMetadata = packHybridCachedShiftMetadata(0u, 18u);
+    return data;
+}
+
 /** Result of evaluating a selected path sample through a shift mapping.
 
     Convention used by spatial/future temporal GRIS reuse:
@@ -396,3 +537,14 @@ struct ShiftMappingResult
     PathSample shiftedSample;              ///< Sample metadata after the shift, before destination-domain localization.
     uint       rejectionReason;           ///< 0 = accepted, nonzero = rejected.
 };
+
+HybridReconnectionData storeCachedHybridShiftResult(HybridReconnectionData data, ShiftMappingResult result)
+{
+    data.cachedShiftedContribution = result.shiftedContribution;
+    data.cachedShiftedTarget = result.shiftedTarget;
+    data.cachedTargetRatio = result.targetRatio;
+    data.cachedJacobian = result.jacobian;
+    data.cachedReusableScatterPdf = result.shiftedSample.reusableScatterPdf;
+    data.cachedShiftMetadata = packHybridCachedShiftMetadata(result.valid ? 1u : 0u, result.rejectionReason);
+    return data;
+}

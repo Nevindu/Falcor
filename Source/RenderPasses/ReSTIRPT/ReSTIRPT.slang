@@ -408,11 +408,46 @@ struct ReSTIRPT
         return getReplayLobeTag(sample.scatterLobeTags0, sample.scatterLobeTags1, vertex);
     }
 
+    /** Fetch the selected path-tree technique tag from a reusable path sample.
+    */
+    uint getSampleTechniqueTag(const PathSample sample, uint vertex)
+    {
+        return getExtendedPathTechniqueTag(sample.techniqueTags0, sample.techniqueTags1, vertex);
+    }
+
+    /** Fetch the NEE lobe tag for an extended path sample.
+    */
+    uint getSampleNEELobeTag(const PathSample sample, uint vertex)
+    {
+        return getExtendedPathNEELobeTag(sample.neeTags0, sample.neeTags1, vertex);
+    }
+
     /** Store the sampled scatter lobe at the current vertex for later replay.
     */
     void recordReplayScatterLobe(inout PathState path, uint lobeType)
     {
         setReplayLobeTag(path.scatterLobeTags0, path.scatterLobeTags1, path.getVertexIndex(), lobeType);
+    }
+
+    /** Record the extended-space tag for the selected RIS candidate.
+
+        Scatter lobe tags remain concrete sampled BSDF lobe masks. The NEE tag is
+        separate so current reconnection code can keep using sampled lobe masks
+        while future hybrid replay can identify the slide-deck N_lobe/all-lobes
+        direct-light connection.
+    */
+    void recordSelectedPathSampleTechnique(inout PathSample sample)
+    {
+        sample.techniqueTags0 = 0u;
+        sample.techniqueTags1 = 0u;
+        sample.neeTags0 = 0u;
+        sample.neeTags1 = 0u;
+
+        const uint techniqueTag = getExtendedPathTechniqueTagForSampleKind(sample.selectedKind);
+        setExtendedPathTechniqueTag(sample.techniqueTags0, sample.techniqueTags1, sample.selectedVertex, techniqueTag);
+
+        if (techniqueTag == kExtendedPathTechniqueNEE)
+            setExtendedPathNEELobeTag(sample.neeTags0, sample.neeTags1, sample.selectedVertex, kExtendedPathLobeAll);
     }
 
     /** Conservative support test for the reused x2 vertex.
@@ -435,9 +470,34 @@ struct ReSTIRPT
         return (lobeTypes & (uint)LobeType::NonDeltaReflection) != 0u;
     }
 
-    /** Mark the path reusable only when the current vertex is the supported x2.
+    /** Conservative support test for the current vertex as a hybrid suffix vertex x_k.
     */
-    void updateFixedX2ReconnectVertex(
+    bool isHybridReconnectibleSurface(
+        const PathState path,
+        const BSDFProperties bsdfProperties,
+        const uint lobeTypes,
+        const bool isTriangleHit,
+        const bool isCurveHit)
+    {
+        const uint vertex = path.getVertexIndex();
+        if (vertex < 2u || vertex > kMaxStoredReplayLobes) return false;
+        if (!isTriangleHit || isCurveHit) return false;
+        if (!path.interiorList.isEmpty() || path.isInsideDielectricVolume()) return false;
+        if (float(path.sceneLength) < params.minReconnectDistance) return false;
+        if (bsdfProperties.roughness <= params.specularRoughnessThreshold) return false;
+        if ((lobeTypes & (uint)LobeType::NonDeltaReflection) == 0u) return false;
+
+        const uint previousLobe = getPathReplayLobeTag(path, vertex - 1u);
+        return isNonDeltaReflectionLobe(previousLobe);
+    }
+
+    /** Mark the first supported reconnection vertex.
+
+        Fixed reconnection only accepts x2. Hybrid keeps that x2 base case, but
+        if x2 was not connectible it records the first later rough reflection
+        vertex as the source suffix vertex x_k.
+    */
+    void updateReconnectVertex(
         inout PathState path,
         const BSDFProperties bsdfProperties,
         const uint lobeTypes,
@@ -445,9 +505,21 @@ struct ReSTIRPT
         const bool isCurveHit)
     {
         if (path.reconnectVertex != kInvalidReconnectVertex) return;
-        if (path.getVertexIndex() != 2u) return;
-        if (isFixedX2ReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit))
+
+        const uint vertex = path.getVertexIndex();
+        if (vertex == 2u && isFixedX2ReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit))
+        {
             path.reconnectVertex = 2u;
+            return;
+        }
+
+        if (RESTIRPT_ENABLE_PREPARED_HYBRID_K3 != 0 &&
+            ShiftMapping(params.shiftMapping) == ShiftMapping::Hybrid &&
+            vertex > 2u &&
+            isHybridReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit))
+        {
+            path.reconnectVertex = vertex;
+        }
     }
 
     void addPathContributionCandidate(
@@ -632,6 +704,24 @@ struct ReSTIRPT
             sample.flags |= kPathSampleFlagCanReconnectAtX2;
         }
         const bool hasSupportedTailReconnect = path.reconnectVertex == 2u && primaryScatterReconnectible;
+        const bool selectedHybridTechnique =
+            path.selectedKind == kPathSampleKindNEE ||
+            path.selectedKind == kPathSampleKindHitLight;
+        const bool reconnectsPastX2 = path.reconnectVertex > 2u && path.reconnectVertex <= kMaxStoredReplayLobes;
+        const bool reconnectScatterSupported =
+            path.selectedVertex <= path.reconnectVertex ||
+            isNonDeltaReflectionLobe(getPathReplayLobeTag(path, path.reconnectVertex));
+        const bool hasSupportedHybridReplayPrefix =
+            RESTIRPT_ENABLE_PREPARED_HYBRID_K3 != 0 &&
+            ShiftMapping(params.shiftMapping) == ShiftMapping::Hybrid &&
+            reconnectsPastX2 &&
+            path.selectedVertex >= path.reconnectVertex &&
+            selectedHybridTechnique &&
+            reconnectScatterSupported;
+        if (hasSupportedHybridReplayPrefix)
+        {
+            sample.flags |= kPathSampleFlagNeedsReplay | kPathSampleFlagHybridK3;
+        }
         if (hasSupportedTailReconnect &&
             ((path.selectedKind == kPathSampleKindNEE && path.selectedVertex > 1u) ||
              ((path.selectedKind == kPathSampleKindHitLight || path.selectedKind == kPathSampleKindEnv) && path.selectedVertex > 2u)))
@@ -653,6 +743,7 @@ struct ReSTIRPT
         sample.reusableLightPdf = path.reusableLightPdf;
         sample.reusableScatterPdf = path.reusableScatterPdf;
         sample.reusableLightFlags = path.reusableLightFlags;
+        recordSelectedPathSampleTechnique(sample);
 
         float3 primaryPosW;
         float3 primaryNormalW;
@@ -846,7 +937,7 @@ struct ReSTIRPT
     */
     bool generateScatterRay(const ShadingData sd, const IMaterialInstance mi, inout PathState path)
     {
-        BSDFSample result;
+        BSDFSample result = {};
         bool valid = mi.sample(sd, path.sg, result, kUseBSDFSampling);
         if (valid) valid = generateScatterRay(result, sd, mi, path);
         return valid;
@@ -1320,7 +1411,7 @@ struct ReSTIRPT
 
         const uint lobeTypes = mi.getLobeTypes(sd);
         const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
-        updateFixedX2ReconnectVertex(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
+        updateReconnectVertex(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
 
         // Check if the scatter event is samplable by the light sampling technique.
         const bool isLightSamplable = path.isLightSamplable();

@@ -12,6 +12,17 @@ import Scene.RaytracingInline;
 import Utils.Color.ColorHelpers;
 import Utils.Sampling.TinyUniformSampleGenerator;
 
+struct SourceReplayMetadata
+{
+    PathSample sample;
+    bool       selectedIsNEE;
+    bool       selectedIsBSDFTerminal;
+    uint       selectedTechniqueTag;
+    uint       selectedNEELobeTag;
+    bool       selectedUsesAllLobes;
+    uint       maxReplayVertex;
+};
+
 /** Fixed-x2 pure reconnection shift entry point.
 
     This file owns the terminal and replay reconnection implementation for the
@@ -578,6 +589,57 @@ extension ReSTIRPT
         return true;
     }
 
+    /** Initialize source replay metadata for fixed-x2 reconnection.
+
+        This is the behavior-preserving source-replay entry point for Stage B of
+        hybrid shift. It centralizes the canonical source-path checks and exposes
+        extended path-space tags for future hybrid replay without making them
+        acceptance criteria for the current fixed-x2 map yet.
+    */
+    bool initializeFixedX2SourceReplay(PathReservoir candidate, out SourceReplayMetadata replay, out PathState path, out uint rejectionReason)
+    {
+        replay = {};
+        path = {};
+        rejectionReason = 0u;
+
+        PathSample sample = candidate.sample;
+        replay.sample = sample;
+        replay.selectedIsNEE = sample.selectedKind == kPathSampleKindNEE;
+        replay.selectedIsBSDFTerminal = sample.selectedKind == kPathSampleKindHitLight || sample.selectedKind == kPathSampleKindEnv;
+        replay.selectedTechniqueTag = getSampleTechniqueTag(sample, sample.selectedVertex);
+        replay.selectedNEELobeTag = getSampleNEELobeTag(sample, sample.selectedVertex);
+        replay.selectedUsesAllLobes = replay.selectedTechniqueTag == kExtendedPathTechniqueNEE && replay.selectedNEELobeTag == kExtendedPathLobeAll;
+
+        if ((sample.flags & kPathSampleFlagNeedsReplay) == 0u || (!replay.selectedIsNEE && !replay.selectedIsBSDFTerminal) || sample.selectedVertex < 2u)
+        {
+            rejectionReason = 8u;
+            return false;
+        }
+        if ((sample.flags & kPathSampleFlagAlreadyShifted) != 0u)
+        {
+            // A shifted replay sample no longer has a canonical primary prefix
+            // recoverable from pathSeed/pathID. Treat this as a replay
+            // self-consistency failure until temporal/replay state is expanded.
+            rejectionReason = 15u;
+            return false;
+        }
+        if (sample.reconnectVertex != 2u || sample.selectedVertex > kMaxStoredReplayLobes + 1u)
+        {
+            rejectionReason = 14u;
+            return false;
+        }
+
+        generatePath(sample.pathID, sample.pathSeed, path);
+        if (!path.isHit())
+        {
+            rejectionReason = 3u;
+            return false;
+        }
+
+        replay.maxReplayVertex = min(sample.selectedVertex, kMaxBounces + 1u);
+        return true;
+    }
+
     /** Replay a source suffix and evaluate the fixed-x2 reconnection shift.
 
         This is the deeper-event path for Y=(y0,y1,x2,...). It rebuilds the
@@ -590,37 +652,19 @@ extension ReSTIRPT
         ShiftMappingResult result = {};
         result.originalTarget = candidate.target;
 
-        PathSample sample = candidate.sample;
-        const bool selectedIsNEE = sample.selectedKind == kPathSampleKindNEE;
-        const bool selectedIsBSDFTerminal = sample.selectedKind == kPathSampleKindHitLight || sample.selectedKind == kPathSampleKindEnv;
-        if ((sample.flags & kPathSampleFlagNeedsReplay) == 0u || (!selectedIsNEE && !selectedIsBSDFTerminal) || sample.selectedVertex < 2u)
+        SourceReplayMetadata replay;
+        PathState path;
+        uint replayReason = 0u;
+        if (!initializeFixedX2SourceReplay(candidate, replay, path, replayReason))
         {
-            result.rejectionReason = 8u;
-            return result;
-        }
-        if ((sample.flags & kPathSampleFlagAlreadyShifted) != 0u)
-        {
-            // A shifted replay sample no longer has a canonical primary prefix
-            // recoverable from pathSeed/pathID. Treat this as a replay
-            // self-consistency failure until temporal/replay state is expanded.
-            result.rejectionReason = 15u;
-            return result;
-        }
-        if (sample.reconnectVertex != 2u || sample.selectedVertex > kMaxStoredReplayLobes + 1u)
-        {
-            result.rejectionReason = 14u;
+            result.rejectionReason = replayReason;
             return result;
         }
 
-        PathState path = {};
-        generatePath(sample.pathID, sample.pathSeed, path);
-        if (!path.isHit())
-        {
-            result.rejectionReason = 3u;
-            return result;
-        }
-
-        const uint maxReplayVertex = min(sample.selectedVertex, kMaxBounces + 1u);
+        PathSample sample = replay.sample;
+        const bool selectedIsNEE = replay.selectedIsNEE;
+        const bool selectedIsBSDFTerminal = replay.selectedIsBSDFTerminal;
+        const uint maxReplayVertex = replay.maxReplayVertex;
         float3 sourcePrimaryPosW = sample.primaryPosW;
         float3 sourceFirstFactor = float3(0.f);
         float3 shiftedFirstFactor = float3(0.f);
@@ -802,7 +846,7 @@ extension ReSTIRPT
                 }
             }
 
-            BSDFSample bs;
+            BSDFSample bs = {};
             bool validScatter = mi.sample(sd, path.sg, bs, kUseBSDFSampling);
             if (!validScatter || bs.pdf <= 0.f || bs.isLobe(LobeType::Delta) || bs.isLobe(LobeType::Transmission))
             {

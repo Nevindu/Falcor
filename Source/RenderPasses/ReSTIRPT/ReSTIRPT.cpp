@@ -30,14 +30,25 @@
 #include "RenderGraph/RenderPassStandardFlags.h"
 #include "Rendering/Lights/EmissiveUniformSampler.h"
 
+#include <chrono>
 
 namespace
 {
+    using CpuClock = std::chrono::steady_clock;
+
+    double elapsedMs(CpuClock::time_point start)
+    {
+        return std::chrono::duration<double, std::milli>(CpuClock::now() - start).count();
+    }
+
     const std::string kGeneratePathsFilename = "RenderPasses/ReSTIRPT/GeneratePaths.cs.slang";
     const std::string kTracePassFilename = "RenderPasses/ReSTIRPT/TracePass.rt.slang";
     const std::string kResolvePassFilename = "RenderPasses/ReSTIRPT/ResolvePass.cs.slang";
+    const std::string kSpatialPathRetraceFilename = "RenderPasses/ReSTIRPT/SpatialPathRetrace.cs.slang";
     const std::string kSpatialReuseFilename = "RenderPasses/ReSTIRPT/SpatialReuse.cs.slang";
     const std::string kReflectTypesFile = "RenderPasses/ReSTIRPT/ReflectTypes.cs.slang";
+
+    constexpr uint32_t kMaxHybridSpatialNeighborCount = 3u;
 
     // Render pass inputs and outputs.
     const std::string kInputVBuffer = "vbuffer";
@@ -96,6 +107,7 @@ namespace
     const std::string kMaxNestedMaterials = "maxNestedMaterials";
     const std::string kUseLightsInDielectricVolumes = "useLightsInDielectricVolumes";
     const std::string kDisableCaustics = "disableCaustics";
+    const std::string kEnablePreparedHybridK3 = "enablePreparedHybridK3";
     const std::string kSpecularRoughnessThreshold = "specularRoughnessThreshold";
     const std::string kMinReconnectDistance = "minReconnectDistance";
     const std::string kMaxReconnectJacobian = "maxReconnectJacobian";
@@ -112,6 +124,7 @@ namespace
     const std::string kSpatialIterations = "spatialIterations";
     const std::string kSpatialMISStrategy = "spatialMISStrategy";
     const std::string kShiftMapping = "shiftMapping";
+    const std::string kHybridShiftMode = "hybridShiftMode";
 
     const Gui::DropdownList kDebugViewList =
     {
@@ -139,6 +152,13 @@ namespace
         { uint32_t(ShiftMapping::Reconnection), "Reconnection" },
         { uint32_t(ShiftMapping::RandomReplay), "Random replay" },
         { uint32_t(ShiftMapping::Hybrid), "Hybrid" },
+    };
+
+    const Gui::DropdownList kHybridShiftModeList =
+    {
+        { uint32_t(HybridShiftMode::FixedX2), "Fixed x2" },
+        { uint32_t(HybridShiftMode::K3ReplayPrefix), "Hybrid replay prefix" },
+        { uint32_t(HybridShiftMode::K3ReplayWithFallback), "Hybrid replay + x2 fallback" },
     };
 }
 
@@ -227,6 +247,7 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kMaxNestedMaterials) mStaticParams.maxNestedMaterials = value;
         else if (key == kUseLightsInDielectricVolumes) mStaticParams.useLightsInDielectricVolumes = value;
         else if (key == kDisableCaustics) mStaticParams.disableCaustics = value;
+        else if (key == kEnablePreparedHybridK3) {} // Deprecated: prepared hybrid is derived from the selected shift mapping.
         else if (key == kSpecularRoughnessThreshold) mParams.specularRoughnessThreshold = value;
         else if (key == kMinReconnectDistance) mParams.minReconnectDistance = value;
         else if (key == kMaxReconnectJacobian) mParams.maxReconnectJacobian = value;
@@ -244,6 +265,7 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kSpatialIterations) mSpatialIterations = value;
         else if (key == kSpatialMISStrategy) mSpatialMISStrategy = value;
         else if (key == kShiftMapping) mParams.shiftMapping = value;
+        else if (key == kHybridShiftMode) mParams.hybridShiftMode = value;
 
         else logWarning("Unknown property '{}' in ReSTIRPT properties.", key);
     }
@@ -326,6 +348,9 @@ void ReSTIRPT::validateOptions()
     mSpatialRadius = std::clamp(mSpatialRadius, 1u, 128u);
     mSpatialIterations = std::clamp(mSpatialIterations, 1u, 1u);
     mParams.shiftMapping = std::min<uint32_t>(mParams.shiftMapping, uint32_t(ShiftMapping::Hybrid));
+    if (mParams.shiftMapping == uint32_t(ShiftMapping::Hybrid))
+        mSpatialNeighborCount = std::min(mSpatialNeighborCount, kMaxHybridSpatialNeighborCount);
+    mParams.hybridShiftMode = std::min<uint32_t>(mParams.hybridShiftMode, uint32_t(HybridShiftMode::K3ReplayWithFallback));
 }
 
 Properties ReSTIRPT::getProperties() const
@@ -379,6 +404,7 @@ Properties ReSTIRPT::getProperties() const
     props[kSpatialIterations] = mSpatialIterations;
     props[kSpatialMISStrategy] = mSpatialMISStrategy;
     props[kShiftMapping] = mParams.shiftMapping;
+    props[kHybridShiftMode] = mParams.hybridShiftMode;
 
     return props;
 }
@@ -413,6 +439,13 @@ void ReSTIRPT::setFrameDim(const uint2 frameDim)
     {
         mVarsChanged = true;
     }
+}
+
+bool ReSTIRPT::usePreparedHybrid() const
+{
+    return mUseSpatialReuse &&
+           mParams.shiftMapping == uint32_t(ShiftMapping::Hybrid) &&
+           mParams.hybridShiftMode != uint32_t(HybridShiftMode::FixedX2);
 }
 
 void ReSTIRPT::setScene(RenderContext* pRenderContext, const ref<Scene>& pScene)
@@ -467,6 +500,10 @@ void ReSTIRPT::execute(RenderContext* pRenderContext, const RenderData& renderDa
     // reservoir. When disabled, keep the original PathTracerN-style resolve path.
     if (mUseSpatialReuse)
     {
+        if (usePreparedHybrid() && mSpatialNeighborCount > 0)
+        {
+            spatialPathRetracePass(pRenderContext, renderData);
+        }
         spatialReusePass(pRenderContext, renderData);
     }
     else
@@ -500,6 +537,7 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
 {
     bool dirty = false;
     bool runtimeDirty = false;
+    const bool wasUsingPreparedHybrid = usePreparedHybrid();
 
     dirty |= widget.var("Initial candidate path trees", mStaticParams.samplesPerPixel, 1u, kMaxSamplesPerPixel);
     widget.tooltip("Number of independent path trees traced per pixel for initial ReSTIR PT candidate generation. Each path tree is reduced to one RIS-selected contribution.");
@@ -589,8 +627,13 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
             runtimeDirty |= group.var("Neighbor count", mSpatialNeighborCount, 0u, 32u);
             runtimeDirty |= group.var("Radius", mSpatialRadius, 1u, 128u);
             runtimeDirty |= group.var("Iterations", mSpatialIterations, 1u, 1u);
-            runtimeDirty |= group.dropdown("Spatial MIS", mSpatialMISStrategy);
-            runtimeDirty |= group.dropdown("Shift mapping", kShiftMappingList, mParams.shiftMapping);
+            dirty |= group.dropdown("Spatial MIS", mSpatialMISStrategy);
+            dirty |= group.dropdown("Shift mapping", kShiftMappingList, mParams.shiftMapping);
+            if (mParams.shiftMapping == uint32_t(ShiftMapping::Hybrid))
+            {
+                dirty |= group.dropdown("Hybrid mode", kHybridShiftModeList, mParams.hybridShiftMode);
+                group.tooltip("Non-fixed hybrid modes automatically use the prepared-prefix retrace pass.");
+            }
         }
     }
 
@@ -643,6 +686,7 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
         widget.tooltip("Selects the color format used for internal per-sample color buffers");
     }
 
+    if (wasUsingPreparedHybrid != usePreparedHybrid()) dirty = true;
     if (dirty) mRecompile = true;
     return dirty || runtimeDirty;
 }
@@ -774,6 +818,7 @@ void ReSTIRPT::resetPrograms()
 {
     mpTracePass = nullptr;
     mpGeneratePaths = nullptr;
+    mpSpatialPathRetracePass = nullptr;
     mpSpatialReusePass = nullptr;
     mpReflectTypes = nullptr;
 
@@ -786,6 +831,17 @@ void ReSTIRPT::updatePrograms()
 
     if (mRecompile == false) return;
 
+    const auto updateStart = CpuClock::now();
+    const bool compilePreparedHybrid = usePreparedHybrid();
+    logInfo(
+        "ReSTIRPT: updatePrograms begin (shiftMapping={}, hybridMode={}, preparedHybrid={}, spatialReuse={}, neighbors={})",
+        mParams.shiftMapping,
+        mParams.hybridShiftMode,
+        compilePreparedHybrid ? 1 : 0,
+        mUseSpatialReuse ? 1 : 0,
+        mSpatialNeighborCount
+    );
+
     // If we get here, a change that require recompilation of shader programs has occurred.
     // This may be due to change of scene defines, type conformances, shader modules, or other changes that require recompilation.
     // When type conformances and/or shader modules change, the programs need to be recreated. We assume programs have been reset upon such changes.
@@ -797,50 +853,100 @@ void ReSTIRPT::updatePrograms()
 
     // Create trace pass.
     if (!mpTracePass)
+    {
+        const auto createStart = CpuClock::now();
+        logInfo("ReSTIRPT: creating trace pass");
         mpTracePass = TracePass::create(mpDevice, "tracePass", "", mpScene, defines, globalTypeConformances);
+        logInfo("ReSTIRPT: created trace pass ({:.2f} ms)", elapsedMs(createStart));
+    }
 
+    const auto traceStart = CpuClock::now();
+    logInfo("ReSTIRPT: preparing trace pass");
     mpTracePass->prepareProgram(mpDevice, defines);
+    logInfo("ReSTIRPT: trace pass vars ready ({:.2f} ms)", elapsedMs(traceStart));
 
     // Create compute passes.
     ProgramDesc baseDesc;
     mpScene->getShaderModules(baseDesc.shaderModules);
     baseDesc.addTypeConformances(globalTypeConformances);
 
+    DefineList spatialPathRetraceDefines = defines;
+    spatialPathRetraceDefines.add("RESTIRPT_SHIFT_MAPPING", std::to_string(mParams.shiftMapping));
+    spatialPathRetraceDefines.add("RESTIRPT_HYBRID_SHIFT_MODE", std::to_string(mParams.hybridShiftMode));
+
+    DefineList spatialReuseDefines = spatialPathRetraceDefines;
+    spatialReuseDefines.add("RESTIRPT_USE_CACHED_PREPARED_HYBRID_K3", "1");
+    uint32_t spatialMISStrategy = static_cast<uint32_t>(mSpatialMISStrategy);
+    if (compilePreparedHybrid)
+    {
+        // Until cached shift records are threaded through generalized/pairwise
+        // denominators, keep prepared hybrid spatial reuse on constant MIS.
+        spatialMISStrategy = uint32_t(SpatialMISStrategy::Constant);
+    }
+    spatialReuseDefines.add("RESTIRPT_SPATIAL_MIS_STRATEGY", std::to_string(spatialMISStrategy));
+
     if (!mpGeneratePaths)
     {
+        const auto createStart = CpuClock::now();
+        logInfo("ReSTIRPT: creating GeneratePaths compute pass");
         ProgramDesc desc = baseDesc;
         desc.addShaderLibrary(kGeneratePathsFilename).csEntry("main");
         mpGeneratePaths = ComputePass::create(mpDevice, desc, defines, false);
+        logInfo("ReSTIRPT: created GeneratePaths compute pass ({:.2f} ms)", elapsedMs(createStart));
+    }
+    if (compilePreparedHybrid && !mpSpatialPathRetracePass)
+    {
+        const auto createStart = CpuClock::now();
+        logInfo("ReSTIRPT: creating SpatialPathRetrace compute pass");
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kSpatialPathRetraceFilename).csEntry("main");
+        mpSpatialPathRetracePass = ComputePass::create(mpDevice, desc, spatialPathRetraceDefines, false);
+        logInfo("ReSTIRPT: created SpatialPathRetrace compute pass ({:.2f} ms)", elapsedMs(createStart));
     }
     if (!mpSpatialReusePass)
     {
+        const auto createStart = CpuClock::now();
+        logInfo("ReSTIRPT: creating SpatialReuse compute pass");
         ProgramDesc desc = baseDesc;
         desc.addShaderLibrary(kSpatialReuseFilename).csEntry("main");
-        mpSpatialReusePass = ComputePass::create(mpDevice, desc, defines, false);
+        mpSpatialReusePass = ComputePass::create(mpDevice, desc, spatialReuseDefines, false);
+        logInfo("ReSTIRPT: created SpatialReuse compute pass ({:.2f} ms)", elapsedMs(createStart));
     }
     if (!mpReflectTypes)
     {
+        const auto createStart = CpuClock::now();
+        logInfo("ReSTIRPT: creating ReflectTypes compute pass");
         ProgramDesc desc = baseDesc;
         desc.addShaderLibrary(kReflectTypesFile).csEntry("main");
         mpReflectTypes = ComputePass::create(mpDevice, desc, defines, false);
+        logInfo("ReSTIRPT: created ReflectTypes compute pass ({:.2f} ms)", elapsedMs(createStart));
     }
 
-    auto preparePass = [&](ref<ComputePass> pass)
+    auto preparePass = [&](const char* name, ref<ComputePass> pass, const DefineList& passDefines)
     {
+        const auto passStart = CpuClock::now();
+        const auto definesStart = CpuClock::now();
+        logInfo("ReSTIRPT: {} setDefines begin", name);
         // Note that we must use set instead of add defines to replace any stale state.
-        pass->getProgram()->setDefines(defines);
+        pass->getProgram()->setDefines(passDefines);
+        logInfo("ReSTIRPT: {} setDefines done ({:.2f} ms)", name, elapsedMs(definesStart));
 
+        const auto varsStart = CpuClock::now();
+        logInfo("ReSTIRPT: {} setVars begin", name);
         // Recreate program vars. This may trigger recompilation if needed.
         // Note that program versions are cached, so switching to a previously used specialization is faster.
         pass->setVars(nullptr);
+        logInfo("ReSTIRPT: {} setVars done ({:.2f} ms, total {:.2f} ms)", name, elapsedMs(varsStart), elapsedMs(passStart));
     };
-    preparePass(mpGeneratePaths);
-    preparePass(mpSpatialReusePass);
-    preparePass(mpResolvePass);
-    preparePass(mpReflectTypes);
+    preparePass("GeneratePaths", mpGeneratePaths, defines);
+    if (compilePreparedHybrid) preparePass("SpatialPathRetrace", mpSpatialPathRetracePass, spatialPathRetraceDefines);
+    preparePass("SpatialReuse", mpSpatialReusePass, spatialReuseDefines);
+    preparePass("Resolve", mpResolvePass, defines);
+    preparePass("ReflectTypes", mpReflectTypes, defines);
 
     mVarsChanged = true;
     mRecompile = false;
+    logInfo("ReSTIRPT: updatePrograms done ({:.2f} ms)", elapsedMs(updateStart));
 }
 
 void ReSTIRPT::prepareResources(RenderContext* pRenderContext, const RenderData& renderData)
@@ -895,6 +1001,25 @@ void ReSTIRPT::prepareResources(RenderContext* pRenderContext, const RenderData&
         mpPreviousReservoirs = mpDevice->createStructuredBuffer(var["previousReservoirs"], reservoirCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
         pRenderContext->clearUAV(mpPreviousReservoirs->getUAV().get(), uint4(0));
         mVarsChanged = true;
+    }
+
+    const bool useHybridSpatialRetrace =
+        usePreparedHybrid() &&
+        mSpatialNeighborCount > 0;
+    if (useHybridSpatialRetrace)
+    {
+        const uint32_t hybridDataStride = std::max(1u, 2u * mSpatialNeighborCount);
+        const uint32_t hybridDataCount = reservoirCount * hybridDataStride;
+        if (!mpHybridReconnectionData || mpHybridReconnectionData->getElementCount() < hybridDataCount || mVarsChanged)
+        {
+            mpHybridReconnectionData = mpDevice->createStructuredBuffer(var["hybridReconnectionData"], hybridDataCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+            pRenderContext->clearUAV(mpHybridReconnectionData->getUAV().get(), uint4(0));
+            mVarsChanged = true;
+        }
+    }
+    else
+    {
+        mpHybridReconnectionData = nullptr;
     }
 
 }
@@ -1250,11 +1375,67 @@ void ReSTIRPT::tracePass(RenderContext* pRenderContext, const RenderData& render
     mpScene->raytrace(pRenderContext, tracePass.pProgram.get(), tracePass.pVars, uint3(mParams.frameDim, 1));
 }
 
+void ReSTIRPT::spatialPathRetracePass(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    FALCOR_PROFILE(pRenderContext, "spatialPathRetracePass");
+
+    FALCOR_ASSERT(mpSpatialPathRetracePass);
+    if (!mpHybridReconnectionData) return;
+
+    const uint32_t hybridDataStride = std::max(1u, 2u * mSpatialNeighborCount);
+    const bool logThisFrame = mParams.frameCount < 2;
+    const auto passStart = CpuClock::now();
+    if (logThisFrame)
+    {
+        logInfo(
+            "ReSTIRPT: SpatialPathRetrace begin (preparedHybrid={}, neighbors={}, stride={})",
+            usePreparedHybrid() ? 1 : 0,
+            mSpatialNeighborCount,
+            hybridDataStride
+        );
+    }
+
+    mpSpatialPathRetracePass->addDefine("USE_VIEW_DIR", (mpScene->getCamera()->getApertureRadius() > 0 && renderData[kInputViewDir] != nullptr) ? "1" : "0");
+    const auto bindStart = CpuClock::now();
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialPathRetrace bind begin");
+
+    auto var = mpSpatialPathRetracePass->getRootVar()["CB"]["gSpatialPathRetracePass"];
+    var["params"].setBlob(mParams);
+    var["inputReservoirs"] = mpCurrentReservoirs;
+    var["hybridReconnectionData"] = mpHybridReconnectionData;
+    var["vbuffer"] = renderData.getTexture(kInputVBuffer);
+    var["viewDir"] = renderData.getTexture(kInputViewDir);
+    var["neighborCount"] = mSpatialNeighborCount;
+    var["radius"] = mSpatialRadius;
+    var["hybridDataStride"] = hybridDataStride;
+
+    mpSpatialPathRetracePass->getRootVar()["gReSTIRPT"] = mpReSTIRPTBlock;
+    mpScene->bindShaderData(mpSpatialPathRetracePass->getRootVar()["gScene"]);
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialPathRetrace bind done ({:.2f} ms)", elapsedMs(bindStart));
+    const auto executeStart = CpuClock::now();
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialPathRetrace execute begin");
+    mpSpatialPathRetracePass->execute(pRenderContext, { mParams.frameDim, 1u });
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialPathRetrace execute done ({:.2f} ms, total {:.2f} ms)", elapsedMs(executeStart), elapsedMs(passStart));
+}
+
 void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData)
 {
     FALCOR_PROFILE(pRenderContext, "spatialReusePass");
 
     FALCOR_ASSERT(mpSpatialReusePass);
+    const bool logThisFrame = mParams.frameCount < 2;
+    const auto passStart = CpuClock::now();
+    if (logThisFrame)
+    {
+        logInfo(
+            "ReSTIRPT: SpatialReuse begin (shiftMapping={}, hybridMode={}, preparedHybrid={}, neighbors={}, mis={})",
+            mParams.shiftMapping,
+            mParams.hybridShiftMode,
+            usePreparedHybrid() ? 1 : 0,
+            mSpatialNeighborCount,
+            static_cast<uint32_t>(mSpatialMISStrategy)
+        );
+    }
 
     mpSpatialReusePass->addDefine("USE_VIEW_DIR", (mpScene->getCamera()->getApertureRadius() > 0 && renderData[kInputViewDir] != nullptr) ? "1" : "0");
 
@@ -1262,6 +1443,8 @@ void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData&
     // produces a second reservoir set. It binds both the scene and ReSTIRPT
     // parameter block because light reconnection evaluates destination-side
     // env/emissive PDFs using the same samplers as the initial NEE pass.
+    const auto bindStart = CpuClock::now();
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialReuse bind begin");
     auto var = mpSpatialReusePass->getRootVar()["CB"]["gSpatialReusePass"];
     var["params"].setBlob(mParams);
     var["inputReservoirs"] = mpCurrentReservoirs;
@@ -1273,10 +1456,16 @@ void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData&
     var["radius"] = mSpatialRadius;
     var["debugView"] = mDebugView;
     var["misStrategy"] = static_cast<uint32_t>(mSpatialMISStrategy);
+    var["hybridReconnectionData"] = mpHybridReconnectionData;
+    var["hybridDataStride"] = std::max(1u, 2u * mSpatialNeighborCount);
 
     mpSpatialReusePass->getRootVar()["gReSTIRPT"] = mpReSTIRPTBlock;
     mpScene->bindShaderData(mpSpatialReusePass->getRootVar()["gScene"]);
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialReuse bind done ({:.2f} ms)", elapsedMs(bindStart));
+    const auto executeStart = CpuClock::now();
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialReuse execute begin");
     mpSpatialReusePass->execute(pRenderContext, { mParams.frameDim, 1u });
+    if (logThisFrame) logInfo("ReSTIRPT: SpatialReuse execute done ({:.2f} ms, total {:.2f} ms)", elapsedMs(executeStart), elapsedMs(passStart));
 }
 
 void ReSTIRPT::resolvePass(RenderContext* pRenderContext, const RenderData& renderData)
@@ -1329,6 +1518,7 @@ DefineList ReSTIRPT::StaticParams::getDefines(const ReSTIRPT& owner) const
     defines.add("USE_ALPHA_TEST", useAlphaTest ? "1" : "0");
     defines.add("USE_LIGHTS_IN_DIELECTRIC_VOLUMES", useLightsInDielectricVolumes ? "1" : "0");
     defines.add("DISABLE_CAUSTICS", disableCaustics ? "1" : "0");
+    defines.add("RESTIRPT_ENABLE_PREPARED_HYBRID_K3", owner.usePreparedHybrid() ? "1" : "0");
     defines.add("PRIMARY_LOD_MODE", std::to_string((uint32_t)primaryLodMode));
     defines.add("COLOR_FORMAT", std::to_string((uint32_t)colorFormat));
     defines.add("MIS_HEURISTIC", std::to_string((uint32_t)misHeuristic));

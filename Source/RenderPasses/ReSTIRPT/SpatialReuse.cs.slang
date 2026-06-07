@@ -11,6 +11,10 @@ import ShiftMappings;
 
 ParameterBlock<ReSTIRPT> gReSTIRPT;
 
+#ifndef RESTIRPT_SPATIAL_MIS_STRATEGY
+#define RESTIRPT_SPATIAL_MIS_STRATEGY 0xffffffff
+#endif
+
 /** Spatial reuse for ReSTIR PT.
 
     The current pixel's reservoir is the defensive/canonical identity candidate.
@@ -27,11 +31,13 @@ struct SpatialReusePass
     RWTexture2D<float4> outputColor;
     Texture2D<PackedHitInfo> vbuffer;
     Texture2D<float3> viewDir;
+    StructuredBuffer<HybridReconnectionData> hybridReconnectionData;
 
     uint neighborCount;
     uint radius;
     uint debugView;
     uint misStrategy;
+    uint hybridDataStride;
 
     static const bool kUseViewDir = USE_VIEW_DIR;
     static const uint kMaxSpatialCandidates = 33u;
@@ -68,6 +74,18 @@ struct SpatialReusePass
     uint reservoirIndex(uint2 pixel)
     {
         return pixel.y * params.frameDim.x + pixel.x;
+    }
+
+    uint hybridDataIndex(uint pixelIndex, uint entry)
+    {
+        return pixelIndex * hybridDataStride + entry;
+    }
+
+    HybridReconnectionData getHybridReconnectionData(uint pixelIndex, uint entry)
+    {
+        if (ShiftMapping(params.shiftMapping) != ShiftMapping::Hybrid)
+            return makeInvalidHybridReconnectionData(0u);
+        return hybridReconnectionData[hybridDataIndex(pixelIndex, entry)];
     }
 
     /** Conservative validity test for a stored reservoir.
@@ -241,7 +259,7 @@ struct SpatialReusePass
         This uses the same selected shift mapping as the accepted-candidate path,
         so generalized/pairwise denominators see the same proposal support.
     */
-    bool evaluateCandidateAtPixel(PathReservoir sourceCandidate, uint2 sourcePixel, uint2 evalPixel, out PathReservoir shifted, out uint rejectionReason)
+    bool evaluateCandidateAtPixel(PathReservoir sourceCandidate, uint2 sourcePixel, uint2 evalPixel, HybridReconnectionData hybridData, out PathReservoir shifted, out uint rejectionReason)
     {
         shifted = sourceCandidate;
         rejectionReason = 0u;
@@ -266,7 +284,7 @@ struct SpatialReusePass
         rejectionReason = getCompatibilityRejection(sourceCandidate, evalPosW, evalNormalW, evalDepth, evalMaterialID);
         if (rejectionReason != 0u) return false;
 
-        ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, evalSd, evalHit, evalPixel);
+        ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, evalSd, evalHit, evalPixel, hybridData);
         float shiftedTarget = 0.f;
         return materializeShiftMappingResult(sourceCandidate, shift, evalSd, evalDepth, evalMaterialID, shifted, shiftedTarget, rejectionReason);
     }
@@ -277,13 +295,13 @@ struct SpatialReusePass
         be shifted from neighbor to center but not back into the neighbor domain,
         the domains do not share support and the imported sample is not eligible.
     */
-    bool hasReverseShiftSupport(PathReservoir shiftedCandidate, uint2 centerPixel, uint2 sourcePixel)
+    bool hasReverseShiftSupport(PathReservoir shiftedCandidate, uint2 centerPixel, uint2 sourcePixel, HybridReconnectionData hybridData)
     {
         if (all(centerPixel == sourcePixel)) return true;
 
         PathReservoir reverseShifted;
         uint reverseReason = 0u;
-        return evaluateCandidateAtPixel(shiftedCandidate, centerPixel, sourcePixel, reverseShifted, reverseReason);
+        return evaluateCandidateAtPixel(shiftedCandidate, centerPixel, sourcePixel, hybridData, reverseShifted, reverseReason);
     }
 
     /** Generalized balance-heuristic weight over all spatial proposal domains.
@@ -318,7 +336,7 @@ struct SpatialReusePass
                 continue;
             }
 
-            if (!evaluateCandidateAtPixel(sourceCandidate, sourcePixel, proposalPixels[j], domainShifted, reason))
+            if (!evaluateCandidateAtPixel(sourceCandidate, sourcePixel, proposalPixels[j], makeInvalidHybridReconnectionData(0u), domainShifted, reason))
                 continue;
 
             const float centerToDomainJacobian = domainShifted.jacobian / centerJacobian;
@@ -355,7 +373,7 @@ struct SpatialReusePass
             {
                 PathReservoir domainShifted;
                 uint reason = 0u;
-                if (!evaluateCandidateAtPixel(sourceCandidate, sourcePixel, proposalPixels[j], domainShifted, reason))
+                if (!evaluateCandidateAtPixel(sourceCandidate, sourcePixel, proposalPixels[j], makeInvalidHybridReconnectionData(0u), domainShifted, reason))
                 {
                     canonicalWeight += 1.f;
                     continue;
@@ -445,7 +463,8 @@ struct SpatialReusePass
         if (any(pixel >= params.frameDim)) return;
 
         uint state = hash(pixel.x | (pixel.y << 16) | (params.frameCount * 0x9e3779b9u));
-        PathReservoir selected = inputReservoirs[reservoirIndex(pixel)];
+        const uint centerIndex = reservoirIndex(pixel);
+        PathReservoir selected = inputReservoirs[centerIndex];
 
         // Zero-neighbor spatial reuse is a debugging passthrough for comparing
         // against initial RIS.
@@ -548,7 +567,8 @@ struct SpatialReusePass
             uint shiftRejectionReason = 0u;
             PathReservoir shiftedCandidate;
             float shiftedTarget = 0.f;
-            ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, dstSd, dstHit, pixel);
+            HybridReconnectionData neighborToCenterData = getHybridReconnectionData(centerIndex, 2u * i + 1u);
+            ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, dstSd, dstHit, pixel, neighborToCenterData);
             if (!materializeShiftMappingResult(sourceCandidate, shift, dstSd, dstDepth, dstMaterialID, shiftedCandidate, shiftedTarget, shiftRejectionReason))
             {
                 lastRejectionReason = shiftRejectionReason;
@@ -556,7 +576,8 @@ struct SpatialReusePass
                 continue;
             }
 
-            if (!hasReverseShiftSupport(shiftedCandidate, pixel, neighborPixel))
+            HybridReconnectionData centerToNeighborData = getHybridReconnectionData(centerIndex, 2u * i);
+            if (!hasReverseShiftSupport(shiftedCandidate, pixel, neighborPixel, centerToNeighborData))
             {
                 lastRejectionReason = 17u;
                 rejected++;
@@ -600,6 +621,11 @@ struct SpatialReusePass
             const uint sourceM = getProposalConfidence(proposalReservoirs[i]);
             if (sourceM == 0u) continue;
             float misWeight = 1.f;
+#if RESTIRPT_SPATIAL_MIS_STRATEGY == 1
+            misWeight = getGeneralizedMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs);
+#elif RESTIRPT_SPATIAL_MIS_STRATEGY == 2
+            misWeight = getPairwiseMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs);
+#elif RESTIRPT_SPATIAL_MIS_STRATEGY == 0xffffffff
             if (misStrategy == kSpatialMISGeneralized)
             {
                 misWeight = getGeneralizedMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs);
@@ -608,6 +634,7 @@ struct SpatialReusePass
             {
                 misWeight = getPairwiseMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs);
             }
+#endif
 
             float candidateWeight = getReservoirCandidateWeight(candidate, misWeight, candidateCount);
             float newWeightSum = weightSum + candidateWeight;

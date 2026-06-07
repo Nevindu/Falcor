@@ -16,6 +16,7 @@ target_sources(ReSTIRPT PRIVATE
     ShiftMapping_RandomReplay.slang
     ShiftMapping_Reconnection.slang
     ShiftMappings.slang
+    SpatialPathRetrace.cs.slang
     SpatialReuse.cs.slang
     StaticParams.slang
     TracePass.rt.slang

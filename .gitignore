@@ -37,3 +37,6 @@
 /.vscode-default/
 
 /scripts/__pycache__/
+
+AGENTS.md
+docs/ReSTIRPT/

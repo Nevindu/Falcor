@@ -91,6 +91,7 @@ private:
     void validateOptions();
     void resetPrograms();
     void updatePrograms();
+    bool usePreparedHybrid() const;
     void setFrameDim(const uint2 frameDim);
     void prepareResources(RenderContext* pRenderContext, const RenderData& renderData);
     void prepareReSTIRPT(const RenderData& renderData);
@@ -105,6 +106,7 @@ private:
     void endFrame(RenderContext* pRenderContext, const RenderData& renderData);
     void generatePaths(RenderContext* pRenderContext, const RenderData& renderData);
     void tracePass(RenderContext* pRenderContext, const RenderData& renderData, TracePass& tracePass);
+    void spatialPathRetracePass(RenderContext* pRenderContext, const RenderData& renderData);
     void spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData);
     void resolvePass(RenderContext* pRenderContext, const RenderData& renderData);
 
@@ -179,6 +181,7 @@ private:
     SpatialMISStrategy              mSpatialMISStrategy = SpatialMISStrategy::Constant; ///< MIS strategy used while merging spatial reservoirs.
 
     ref<ComputePass>                mpGeneratePaths;            ///< Fullscreen compute pass generating paths starting at primary hits.
+    ref<ComputePass>                mpSpatialPathRetracePass;   ///< Hybrid-only spatial prefix retrace pass.
     ref<ComputePass>                mpSpatialReusePass;         ///< Spatial reservoir reuse pass.
     ref<ComputePass>                mpResolvePass;              ///< Sample resolve pass.
     ref<ComputePass>                mpReflectTypes;             ///< Helper for reflecting structured buffer types.
@@ -190,4 +193,5 @@ private:
     ref<Buffer>                     mpCurrentReservoirs;        ///< Current-frame ReSTIR PT reservoirs, one per pixel.
     ref<Buffer>                     mpSpatialReservoirs;        ///< Spatial reuse output reservoirs, one per pixel.
     ref<Buffer>                     mpPreviousReservoirs;       ///< Previous-frame ReSTIR PT reservoirs, one per pixel.
+    ref<Buffer>                     mpHybridReconnectionData;   ///< Per-neighbor destination-prefix data for hybrid spatial reuse.
 };
