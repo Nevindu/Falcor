@@ -32,12 +32,23 @@ struct SpatialReusePass
     uint radius;
     uint debugView;
     uint misStrategy;
+    uint featureBasedRejection;
 
     static const bool kUseViewDir = USE_VIEW_DIR;
+    // Geometry-similarity thresholds for feature-based neighbor rejection
+    // (normal dot >= 0.5, relative depth within 10%).
+    static const float kFeatureNormalThreshold = 0.5f;
+    static const float kFeatureRelativeDepthThreshold = 0.1f;
     static const uint kMaxSpatialCandidates = 33u;
     static const uint kSpatialMISConstant = 0u;
     static const uint kSpatialMISGeneralized = 1u;
     static const uint kSpatialMISPairwise = 2u;
+
+    // Admit a neighbor only if BOTH the forward (neighbor->center) and reverse
+    // (center->neighbor) shifts succeed. Asymmetric support (one direction fails) unbalances
+    // the defensive pairwise -> Sum m_i != 1 -> systematic bias. The reverse target/jacobian
+    // is cached per neighbor so the canonical MIS term does not re-trace it.
+    static const bool kEnforceShiftInvertibility = true;
 
     /** Small deterministic integer hash used for neighbor sampling.
 
@@ -118,12 +129,22 @@ struct SpatialReusePass
         0 accepted
         3 destination has no visible surface
         4 source reservoir has no stored primary surface
+        5 neighbor surface is too geometrically dissimilar (feature-based rejection)
     */
     uint getCompatibilityRejection(PathReservoir candidate, float3 dstPosW, float3 dstNormalW, float dstDepth, uint dstMaterialID)
     {
         if (!isValid(candidate)) return 1u;
         if (dstDepth <= 0.f) return 3u;
         if (candidate.sample.primaryDepth <= 0.f) return 4u;
+
+        // Skip neighbors whose primary surface differs too much in orientation or camera
+        // distance: keeps high-variance, low-support shifts (a firefly source) out of the
+        // reuse set. Unbiased -- a rejected domain simply does not participate.
+        if (featureBasedRejection != 0u)
+        {
+            if (dot(dstNormalW, candidate.sample.primaryNormalW) < kFeatureNormalThreshold) return 5u;
+            if (abs(dstDepth - candidate.sample.primaryDepth) >= kFeatureRelativeDepthThreshold * dstDepth) return 5u;
+        }
 
         return 0u;
     }
@@ -296,15 +317,20 @@ struct SpatialReusePass
         return denominator > 0.f ? numerator / denominator : 0.f;
     }
 
-    /** Pairwise MIS between the canonical proposal and one neighbor at a time.
+    /** Defensive pairwise MIS between the canonical proposal and one neighbor at a time.
 
-        The canonical branch averages pairwise canonical weights over neighbors;
-        non-canonical branches return their pair contribution divided by the
-        number of pairs, not the total proposal count. As with generalized MIS,
-        the returned value is m_i(y); getReservoirCandidateWeight() supplies the
-        final totalM factor.
+        The canonical weight carries a defensive self-pair term of 1 and both branches
+        normalize by the total proposal count (k + 1), k = neighbor count. The defensive
+        term keeps the estimator unbiased under asymmetric shift support: when the
+        center->neighbor shift fails the canonical absorbs the missing pair weight instead
+        of the partition over-counting. A plain /pairCount without the defensive +1
+        over-brightens whenever shifts fail one-directionally. The per-pair canonical
+        confidence is still split by pairCount inside each share.
+
+        Returns m_i(y); getReservoirCandidateWeight() supplies the final totalM factor
+        (which cancels the /M in finalizeReservoir()).
     */
-    float getPairwiseMISWeight(PathReservoir sourceCandidate, PathReservoir shiftedToCenter, uint2 sourcePixel, uint sourceM, uint proposalCount, uint2 proposalPixels[kMaxSpatialCandidates], PathReservoir proposalReservoirs[kMaxSpatialCandidates])
+    float getPairwiseMISWeight(PathReservoir sourceCandidate, PathReservoir shiftedToCenter, uint2 sourcePixel, uint sourceM, uint proposalCount, uint2 proposalPixels[kMaxSpatialCandidates], PathReservoir proposalReservoirs[kMaxSpatialCandidates], float reverseShiftTarget[kMaxSpatialCandidates], float reverseShiftJacobian[kMaxSpatialCandidates])
     {
         if (proposalCount <= 1u) return 1.f;
 
@@ -313,30 +339,28 @@ struct SpatialReusePass
 
         if (all(sourcePixel == proposalPixels[0]))
         {
-            float canonicalWeight = 0.f;
+            // Defensive canonical self-pair term. Each pair then subtracts the
+            // neighbor's share; a failed center->neighbor shift leaves the full 1.
+            float canonicalWeight = 1.f;
             for (uint j = 1u; j < proposalCount; j++)
             {
-                PathReservoir domainShifted;
-                uint reason = 0u;
-                if (!evaluateCandidateAtPixel(sourceCandidate, sourcePixel, proposalPixels[j], domainShifted, reason))
-                {
-                    canonicalWeight += 1.f;
-                    continue;
-                }
-
+                // Canonical (=sourceCandidate) shifted into domain j is the reverse center->j
+                // shift, cached at admission for every geometry-valid neighbor. A cached
+                // target of 0 means the reverse failed -> neighborPdf 0 -> the canonical keeps
+                // its full defensive +1 for this pair (no re-trace here).
                 const uint domainM = getProposalConfidence(proposalReservoirs[j]);
-                const float neighborPdf = domainM > 0u ? domainShifted.shiftedTarget * domainShifted.jacobian * float(domainM) : 0.f;
+                const float neighborPdf = domainM > 0u ? reverseShiftTarget[j] * reverseShiftJacobian[j] * float(domainM) : 0.f;
                 const float canonicalPdf = sourceCandidate.sample.target * float(canonicalM) / pairCount;
                 canonicalWeight += 1.f - (neighborPdf > 0.f ? neighborPdf / (neighborPdf + canonicalPdf) : 0.f);
             }
-            return canonicalWeight / pairCount;
+            return canonicalWeight / float(proposalCount);
         }
 
         if (shiftedToCenter.jacobian <= 0.f || sourceCandidate.sample.target <= 0.f) return 0.f;
 
         const float neighborPdf = sourceCandidate.sample.target * rcp(shiftedToCenter.jacobian) * float(sourceM);
         const float canonicalPdf = shiftedToCenter.shiftedTarget * float(canonicalM) / pairCount;
-        return (neighborPdf + canonicalPdf) > 0.f ? (neighborPdf / (neighborPdf + canonicalPdf)) / pairCount : 0.f;
+        return (neighborPdf + canonicalPdf) > 0.f ? (neighborPdf / (neighborPdf + canonicalPdf)) / float(proposalCount) : 0.f;
     }
 
     /** Beauty contribution from a finalized spatial reservoir.
@@ -421,11 +445,23 @@ struct SpatialReusePass
         uint lastRejectionReason = 0u;
         float weightSum = 0.f;
         float selectedDistance = 0.f;
+        // Diagnostics: sum of the effective MIS weights actually used over accepted
+        // candidates (debugView 17). Constant uses M_i/candidateCount, which sums to
+        // exactly 1 by construction. Generalized/pairwise accumulate m_i(y_i), each
+        // evaluated at a DIFFERENT selected sample y_i, so this sum is NOT expected to be
+        // 1 (the partition of unity Sum_i m_i(y)=1 holds per-fixed-y, not across the
+        // per-candidate samples). Do not treat a non-1 value here as a bug for those modes.
+        float misWeightSum = 0.f;
         PathReservoir proposalReservoirs[kMaxSpatialCandidates];
         PathReservoir shiftedCandidates[kMaxSpatialCandidates];
         uint2 proposalPixels[kMaxSpatialCandidates];
         float proposalDistances[kMaxSpatialCandidates];
         uint proposalAccepted[kMaxSpatialCandidates];
+        // Cached reverse shift (canonical -> proposal pixel), filled at admission time so the
+        // pairwise canonical MIS term does not re-trace it. Only valid for accepted neighbor
+        // proposals (index > 0); the canonical's self entry is unused.
+        float reverseShiftTarget[kMaxSpatialCandidates];
+        float reverseShiftJacobian[kMaxSpatialCandidates];
         uint proposalCount = 0u;
 
         ShadingData dstSd;
@@ -443,7 +479,10 @@ struct SpatialReusePass
         }
 
         // Seed the proposal-domain list with the current pixel's canonical
-        // domain. It remains in MIS even if the current reservoir is invalid.
+        // domain. Confidence is only added once a domain produces a positive-density
+        // shift, so the GRIS normalization counts only the candidates that can
+        // actually contribute. Counting failed shifts here biases the
+        // Constant estimator dark.
         uint selfShiftRejection = 0u;
         PathReservoir selfShifted;
         proposalReservoirs[proposalCount] = selected;
@@ -451,11 +490,11 @@ struct SpatialReusePass
         proposalPixels[proposalCount] = pixel;
         proposalDistances[proposalCount] = 0.f;
         proposalAccepted[proposalCount] = 0u;
-        candidateCount += getProposalConfidence(selected);
         if (evaluateIdentityCandidate(selected, selfShifted, selfShiftRejection))
         {
             shiftedCandidates[proposalCount] = selfShifted;
             proposalAccepted[proposalCount] = 1u;
+            candidateCount += getProposalConfidence(selected);
             accepted++;
         }
         else
@@ -488,15 +527,6 @@ struct SpatialReusePass
                 continue;
             }
 
-            const uint proposalIndex = proposalCount;
-            proposalReservoirs[proposalIndex] = sourceCandidate;
-            shiftedCandidates[proposalIndex] = {};
-            proposalPixels[proposalIndex] = neighborPixel;
-            proposalDistances[proposalIndex] = length(float2(offset));
-            proposalAccepted[proposalIndex] = 0u;
-            proposalCount++;
-            candidateCount += getProposalConfidence(sourceCandidate);
-
             const uint rejectionReason = getCompatibilityRejection(sourceCandidate, dstPosW, dstNormalW, dstDepth, dstMaterialID);
             if (rejectionReason != 0u)
             {
@@ -505,20 +535,72 @@ struct SpatialReusePass
                 continue;
             }
 
+            // Geometry-valid neighbor: joins the proposal set (counted in proposalCount and
+            // the canonical's defensive accounting) regardless of whether its shifts succeed,
+            // keeping the /(k+1) normalization correct. Its CONTRIBUTION is admitted
+            // separately, only when the shift is invertible.
+            const uint proposalIndex = proposalCount;
+            proposalReservoirs[proposalIndex] = sourceCandidate;
+            shiftedCandidates[proposalIndex] = {};
+            proposalPixels[proposalIndex] = neighborPixel;
+            proposalDistances[proposalIndex] = length(float2(offset));
+            proposalAccepted[proposalIndex] = 0u;
+            reverseShiftTarget[proposalIndex] = 0.f;
+            reverseShiftJacobian[proposalIndex] = 0.f;
+            proposalCount++;
+
+            // Reverse shift center -> neighbor, cached for the pairwise canonical MIS term
+            // (a cached target of 0 means the reverse failed -> the canonical keeps its full
+            // defensive weight for this pair). Computed once for every geometry-valid neighbor
+            // so getPairwiseMISWeight never re-traces it.
+            bool reverseValid = false;
+            {
+                ShadingData nSd; HitInfo nHit; float3 nP; float3 nN; float nD; uint nMat;
+                if (loadPrimarySurface(neighborPixel, nSd, nHit, nP, nN, nD, nMat))
+                {
+                    ShiftMappingResult rev = gReSTIRPT.applyShiftMapping(selected, nSd, nHit, neighborPixel);
+                    if (rev.valid && rev.shiftedTarget > 0.f && rev.jacobian > 0.f)
+                    {
+                        reverseShiftTarget[proposalIndex] = rev.shiftedTarget;
+                        reverseShiftJacobian[proposalIndex] = rev.jacobian;
+                        reverseValid = true;
+                    }
+                }
+            }
+
+            // Forward shift: neighbor -> center (the reused contribution).
             uint shiftRejectionReason = 0u;
             PathReservoir shiftedCandidate;
             float shiftedTarget = 0.f;
             ShiftMappingResult shift = gReSTIRPT.applyShiftMapping(sourceCandidate, dstSd, dstHit, pixel);
-            if (!materializeShiftMappingResult(sourceCandidate, shift, dstSd, dstDepth, dstMaterialID, shiftedCandidate, shiftedTarget, shiftRejectionReason))
-            {
-                lastRejectionReason = shiftRejectionReason;
-                rejected++;
-                continue;
-            }
+            const bool forwardValid = materializeShiftMappingResult(sourceCandidate, shift, dstSd, dstDepth, dstMaterialID, shiftedCandidate, shiftedTarget, shiftRejectionReason);
 
-            shiftedCandidates[proposalIndex] = shiftedCandidate;
-            proposalAccepted[proposalIndex] = 1u;
-            accepted++;
+            // Admit the CONTRIBUTION only if the shift is invertible (both directions succeed).
+            // A forward-ok/reverse-fail neighbor stays in the defensive accounting above but
+            // must not contribute, else the canonical keeps full weight AND the neighbor adds
+            // its own -> Sum m_i > 1 -> over-bright.
+            // (Set kEnforceShiftInvertibility = false to reproduce that bug.)
+            const bool contribute = forwardValid && (!kEnforceShiftInvertibility || reverseValid);
+            if (contribute)
+            {
+                shiftedCandidates[proposalIndex] = shiftedCandidate;
+                proposalAccepted[proposalIndex] = 1u;
+                candidateCount += getProposalConfidence(sourceCandidate);
+                accepted++;
+            }
+            else
+            {
+                // Contribution not admitted: clear the cached reverse shift so the canonical's
+                // defensive term does not subtract this pair's share either. The mirror case --
+                // reverse (center->neighbor) ok but forward (neighbor->center) failed, e.g. a
+                // direct-NEE neighbor reconnection cannot import -- would otherwise drain
+                // canonical weight with no contribution -> Sum m_i < 1 -> too dark. Keeps the
+                // subtraction symmetric with contribution admission.
+                reverseShiftTarget[proposalIndex] = 0.f;
+                reverseShiftJacobian[proposalIndex] = 0.f;
+                lastRejectionReason = forwardValid ? 16u : shiftRejectionReason;
+                rejected++;
+            }
         }
 
         for (uint i = 0u; i < proposalCount; i++)
@@ -534,8 +616,14 @@ struct SpatialReusePass
             }
             else if (misStrategy == kSpatialMISPairwise)
             {
-                misWeight = getPairwiseMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs);
+                misWeight = getPairwiseMISWeight(proposalReservoirs[i], candidate, proposalPixels[i], sourceM, proposalCount, proposalPixels, proposalReservoirs, reverseShiftTarget, reverseShiftJacobian);
             }
+
+            // Track the effective MIS weight contributed by this candidate so the
+            // debug view can confirm the per-pixel weights sum to 1.
+            misWeightSum += (misStrategy == kSpatialMISConstant)
+                ? float(sourceM) / float(max(1u, candidateCount))
+                : misWeight;
 
             float candidateWeight = getReservoirCandidateWeight(candidate, misWeight, candidateCount);
             float newWeightSum = weightSum + candidateWeight;
@@ -557,7 +645,42 @@ struct SpatialReusePass
 
         selected = finalizeReservoir(selected, weightSum, candidateCount, accepted, rejected, selectedDistance, accepted > 0u ? 0u : lastRejectionReason);
         outputReservoirs[reservoirIndex(pixel)] = selected;
-        outputColor[pixel] = float4(getDebugColor(selected), 1.f);
+
+        float3 debugColor;
+        if (debugView == 17u)
+        {
+            // Sum of effective MIS weights. Meaningful only for Constant, where it must
+            // read 1 (green); >1 red, <1 blue. For generalized/pairwise the sum is over
+            // distinct per-candidate samples and is not expected to be 1 (see note above).
+            const float s = misWeightSum;
+            debugColor = float3(max(0.f, s - 1.f), max(0.f, 1.f - abs(s - 1.f)), max(0.f, 1.f - s));
+        }
+        else if (debugView == 18u)
+        {
+            // Fraction of considered proposal domains whose shift succeeded.
+            debugColor = (float(accepted) / max(1.f, float(proposalCount))).xxx;
+        }
+        else if (debugView == 19u)
+        {
+            // DIAGNOSTIC: same-pixel identity test for the shift mapping. Shift the
+            // canonical reservoir into its OWN primary domain through the real shift
+            // (not the trivial identity short-circuit) and output shiftedTarget/target.
+            // A faithful unit-Jacobian identity yields exactly 1 everywhere; a reject/
+            // invalid yields 0. This isolates replay-mapping faithfulness from cross-
+            // pixel Jacobian and resampling-MIS effects, and separates it from the
+            // rejection rate (the 0-valued pixels).
+            PathReservoir canon = inputReservoirs[reservoirIndex(pixel)];
+            ShiftMappingResult selfShift = gReSTIRPT.applyShiftMapping(canon, dstSd, dstHit, pixel);
+            if (isValid(canon) && selfShift.valid && selfShift.shiftedTarget > 0.f && canon.target > 0.f)
+                debugColor = float3(selfShift.shiftedTarget / canon.target, float(canon.sample.selectedVertex), float(canon.sample.selectedKind));
+            else
+                debugColor = float3(0.f, -1.f, -1.f);
+        }
+        else
+        {
+            debugColor = getDebugColor(selected);
+        }
+        outputColor[pixel] = float4(debugColor, 1.f);
     }
 };
 

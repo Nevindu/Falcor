@@ -111,6 +111,7 @@ namespace
     const std::string kSpatialRadius = "spatialRadius";
     const std::string kSpatialIterations = "spatialIterations";
     const std::string kSpatialMISStrategy = "spatialMISStrategy";
+    const std::string kFeatureBasedRejection = "featureBasedRejection";
     const std::string kShiftMapping = "shiftMapping";
 
     const Gui::DropdownList kDebugViewList =
@@ -132,6 +133,8 @@ namespace
         { 14u, "Spatial rejection reason" },
         { 15u, "Spatial shift mask" },
         { 16u, "Replay mismatch mask" },
+        { 17u, "Spatial MIS weight sum" },
+        { 18u, "Spatial accepted fraction" },
     };
 
     const Gui::DropdownList kShiftMappingList =
@@ -243,6 +246,7 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kSpatialRadius) mSpatialRadius = value;
         else if (key == kSpatialIterations) mSpatialIterations = value;
         else if (key == kSpatialMISStrategy) mSpatialMISStrategy = value;
+        else if (key == kFeatureBasedRejection) mFeatureBasedRejection = value;
         else if (key == kShiftMapping) mParams.shiftMapping = value;
 
         else logWarning("Unknown property '{}' in ReSTIRPT properties.", key);
@@ -378,6 +382,7 @@ Properties ReSTIRPT::getProperties() const
     props[kSpatialRadius] = mSpatialRadius;
     props[kSpatialIterations] = mSpatialIterations;
     props[kSpatialMISStrategy] = mSpatialMISStrategy;
+    props[kFeatureBasedRejection] = mFeatureBasedRejection;
     props[kShiftMapping] = mParams.shiftMapping;
 
     return props;
@@ -590,6 +595,8 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
             runtimeDirty |= group.var("Radius", mSpatialRadius, 1u, 128u);
             runtimeDirty |= group.var("Iterations", mSpatialIterations, 1u, 1u);
             runtimeDirty |= group.dropdown("Spatial MIS", mSpatialMISStrategy);
+            runtimeDirty |= group.checkbox("Feature-based rejection", mFeatureBasedRejection);
+            group.tooltip("Reject spatial neighbors whose primary surface differs too much in normal or camera distance. Reduces fireflies/variance from low-support shifts; the estimator stays unbiased.");
             runtimeDirty |= group.dropdown("Shift mapping", kShiftMappingList, mParams.shiftMapping);
         }
     }
@@ -1273,6 +1280,7 @@ void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData&
     var["radius"] = mSpatialRadius;
     var["debugView"] = mDebugView;
     var["misStrategy"] = static_cast<uint32_t>(mSpatialMISStrategy);
+    var["featureBasedRejection"] = mFeatureBasedRejection ? 1u : 0u;
 
     mpSpatialReusePass->getRootVar()["gReSTIRPT"] = mpReSTIRPTBlock;
     mpScene->bindShaderData(mpSpatialReusePass->getRootVar()["gScene"]);

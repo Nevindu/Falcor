@@ -176,7 +176,8 @@ private:
     uint32_t                        mSpatialNeighborCount = 3;  ///< Number of spatial neighbors to test.
     uint32_t                        mSpatialRadius = 20;        ///< Spatial neighbor radius in pixels.
     uint32_t                        mSpatialIterations = 1;     ///< Number of spatial reuse iterations. Currently clamped to one.
-    SpatialMISStrategy              mSpatialMISStrategy = SpatialMISStrategy::Constant; ///< MIS strategy used while merging spatial reservoirs.
+    SpatialMISStrategy              mSpatialMISStrategy = SpatialMISStrategy::Pairwise; ///< MIS strategy used while merging spatial reservoirs. Pairwise is the only defensive estimator: it stays ~unbiased under asymmetric/conservative shift support, while Constant (no resampling MIS) and Generalized (non-defensive balance heuristic) systematically over-brighten when shifts fail one-directionally.
+    bool                            mFeatureBasedRejection = false; ///< Reject geometrically dissimilar spatial neighbors. Default off: the denominator check in evaluateCandidateAtPixel currently compares source-vs-domain, not center-vs-domain, so enabling it can break the MIS partition of unity. Make consistent before enabling.
 
     ref<ComputePass>                mpGeneratePaths;            ///< Fullscreen compute pass generating paths starting at primary hits.
     ref<ComputePass>                mpSpatialReusePass;         ///< Spatial reservoir reuse pass.
