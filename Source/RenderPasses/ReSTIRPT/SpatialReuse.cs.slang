@@ -223,6 +223,19 @@ struct SpatialReusePass
         return reservoir.shiftedTarget * reservoir.W * float(max(1u, totalCandidateCount)) * reservoir.jacobian * misWeight;
     }
 
+    /** Estimated normalizer for a reservoir proposal distribution.
+
+        For a RIS reservoir, W = wSum / (pHat(selected) * M), so
+        Z ~= wSum / M = pHat(selected) * W. Dividing target terms by this
+        normalizer gives the proposal-density proxy used by spatial MIS.
+    */
+    float getReservoirNormalizer(PathReservoir reservoir)
+    {
+        const uint reservoirM = getProposalConfidence(reservoir);
+        if (reservoirM == 0u || reservoir.wSum <= 0.f) return 0.f;
+        return max(1e-8f, reservoir.wSum / float(reservoirM));
+    }
+
     /** Evaluate a source candidate in another proposal domain for MIS terms.
 
         This uses the same selected shift mapping as the accepted-candidate path,
@@ -258,6 +271,21 @@ struct SpatialReusePass
         return materializeShiftMappingResult(sourceCandidate, shift, evalSd, evalDepth, evalMaterialID, shifted, shiftedTarget, rejectionReason);
     }
 
+    /** Check that an imported sample has reverse support under the selected map.
+
+        Spatial reuse compares proposal densities across domains. If a sample can
+        be shifted from neighbor to center but not back into the neighbor domain,
+        the domains do not share support and the imported sample is not eligible.
+    */
+    bool hasReverseShiftSupport(PathReservoir shiftedCandidate, uint2 centerPixel, uint2 sourcePixel)
+    {
+        if (all(centerPixel == sourcePixel)) return true;
+
+        PathReservoir reverseShifted;
+        uint reverseReason = 0u;
+        return evaluateCandidateAtPixel(shiftedCandidate, centerPixel, sourcePixel, reverseShifted, reverseReason);
+    }
+
     /** Generalized balance-heuristic weight over all spatial proposal domains.
 
         Densities are compared in the current pixel domain by mapping the source
@@ -269,7 +297,9 @@ struct SpatialReusePass
         if (shiftedToCenter.jacobian <= 0.f || sourceCandidate.sample.target <= 0.f) return 0.f;
 
         const float centerJacobian = shiftedToCenter.jacobian;
-        const float numerator = sourceCandidate.sample.target * rcp(centerJacobian) * float(max(1u, sourceM));
+        const float sourceZ = getReservoirNormalizer(sourceCandidate);
+        const float numerator = sourceZ > 0.f ? (sourceCandidate.sample.target / sourceZ) * rcp(centerJacobian) * float(max(1u, sourceM)) : 0.f;
+        if (numerator <= 0.f) return 0.f;
         float denominator = 0.f;
 
         for (uint j = 0u; j < proposalCount; j++)
@@ -279,9 +309,12 @@ struct SpatialReusePass
             const uint domainM = getProposalConfidence(proposalReservoirs[j]);
             if (domainM == 0u) continue;
 
+            const float domainZ = getReservoirNormalizer(proposalReservoirs[j]);
+            if (domainZ <= 0.f) continue;
+
             if (all(proposalPixels[j] == sourcePixel))
             {
-                denominator += sourceCandidate.sample.target * rcp(centerJacobian) * float(domainM);
+                denominator += (sourceCandidate.sample.target / domainZ) * rcp(centerJacobian) * float(domainM);
                 continue;
             }
 
@@ -290,7 +323,7 @@ struct SpatialReusePass
 
             const float centerToDomainJacobian = domainShifted.jacobian / centerJacobian;
             if (domainShifted.shiftedTarget > 0.f && centerToDomainJacobian > 0.f)
-                denominator += domainShifted.shiftedTarget * centerToDomainJacobian * float(domainM);
+                denominator += (domainShifted.shiftedTarget / domainZ) * centerToDomainJacobian * float(domainM);
         }
 
         return denominator > 0.f ? numerator / denominator : 0.f;
@@ -309,11 +342,15 @@ struct SpatialReusePass
         if (proposalCount <= 1u) return 1.f;
 
         const uint canonicalM = getProposalConfidence(proposalReservoirs[0]);
+        const float canonicalZ = getReservoirNormalizer(proposalReservoirs[0]);
         const float pairCount = float(max(1u, proposalCount - 1u));
 
         if (all(sourcePixel == proposalPixels[0]))
         {
+            if (canonicalM == 0u || canonicalZ <= 0.f || sourceCandidate.sample.target <= 0.f) return 0.f;
+
             float canonicalWeight = 0.f;
+            const float canonicalPdf = (sourceCandidate.sample.target / canonicalZ) * float(canonicalM);
             for (uint j = 1u; j < proposalCount; j++)
             {
                 PathReservoir domainShifted;
@@ -325,17 +362,21 @@ struct SpatialReusePass
                 }
 
                 const uint domainM = getProposalConfidence(proposalReservoirs[j]);
-                const float neighborPdf = domainM > 0u ? domainShifted.shiftedTarget * domainShifted.jacobian * float(domainM) : 0.f;
-                const float canonicalPdf = sourceCandidate.sample.target * float(canonicalM) / pairCount;
-                canonicalWeight += 1.f - (neighborPdf > 0.f ? neighborPdf / (neighborPdf + canonicalPdf) : 0.f);
+                const float domainZ = getReservoirNormalizer(proposalReservoirs[j]);
+                const float neighborPdf = domainM > 0u && domainZ > 0.f ? (domainShifted.shiftedTarget / domainZ) * domainShifted.jacobian * float(domainM) : 0.f;
+                const float pairNormalization = neighborPdf + canonicalPdf;
+                canonicalWeight += 1.f - (neighborPdf > 0.f && pairNormalization > 0.f ? neighborPdf / pairNormalization : 0.f);
             }
             return canonicalWeight / pairCount;
         }
 
         if (shiftedToCenter.jacobian <= 0.f || sourceCandidate.sample.target <= 0.f) return 0.f;
 
-        const float neighborPdf = sourceCandidate.sample.target * rcp(shiftedToCenter.jacobian) * float(sourceM);
-        const float canonicalPdf = shiftedToCenter.shiftedTarget * float(canonicalM) / pairCount;
+        const float sourceZ = getReservoirNormalizer(sourceCandidate);
+        if (sourceZ <= 0.f) return 0.f;
+
+        const float neighborPdf = (sourceCandidate.sample.target / sourceZ) * rcp(shiftedToCenter.jacobian) * float(sourceM);
+        const float canonicalPdf = canonicalZ > 0.f ? (shiftedToCenter.shiftedTarget / canonicalZ) * float(canonicalM) : 0.f;
         return (neighborPdf + canonicalPdf) > 0.f ? (neighborPdf / (neighborPdf + canonicalPdf)) / pairCount : 0.f;
     }
 
@@ -451,9 +492,9 @@ struct SpatialReusePass
         proposalPixels[proposalCount] = pixel;
         proposalDistances[proposalCount] = 0.f;
         proposalAccepted[proposalCount] = 0u;
-        candidateCount += getProposalConfidence(selected);
         if (evaluateIdentityCandidate(selected, selfShifted, selfShiftRejection))
         {
+            candidateCount += getProposalConfidence(selected);
             shiftedCandidates[proposalCount] = selfShifted;
             proposalAccepted[proposalCount] = 1u;
             accepted++;
@@ -495,7 +536,6 @@ struct SpatialReusePass
             proposalDistances[proposalIndex] = length(float2(offset));
             proposalAccepted[proposalIndex] = 0u;
             proposalCount++;
-            candidateCount += getProposalConfidence(sourceCandidate);
 
             const uint rejectionReason = getCompatibilityRejection(sourceCandidate, dstPosW, dstNormalW, dstDepth, dstMaterialID);
             if (rejectionReason != 0u)
@@ -516,9 +556,41 @@ struct SpatialReusePass
                 continue;
             }
 
+            if (!hasReverseShiftSupport(shiftedCandidate, pixel, neighborPixel))
+            {
+                lastRejectionReason = 17u;
+                rejected++;
+                continue;
+            }
+
+            candidateCount += getProposalConfidence(sourceCandidate);
             shiftedCandidates[proposalIndex] = shiftedCandidate;
             proposalAccepted[proposalIndex] = 1u;
             accepted++;
+        }
+
+        {
+            uint compactCount = 0u;
+            uint compactCandidateCount = 0u;
+            for (uint i = 0u; i < proposalCount; i++)
+            {
+                if (proposalAccepted[i] == 0u) continue;
+
+                if (compactCount != i)
+                {
+                    proposalReservoirs[compactCount] = proposalReservoirs[i];
+                    shiftedCandidates[compactCount] = shiftedCandidates[i];
+                    proposalPixels[compactCount] = proposalPixels[i];
+                    proposalDistances[compactCount] = proposalDistances[i];
+                    proposalAccepted[compactCount] = proposalAccepted[i];
+                }
+
+                compactCandidateCount += getProposalConfidence(proposalReservoirs[compactCount]);
+                compactCount++;
+            }
+
+            proposalCount = compactCount;
+            candidateCount = compactCandidateCount;
         }
 
         for (uint i = 0u; i < proposalCount; i++)
