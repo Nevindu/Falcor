@@ -18,6 +18,7 @@ target_sources(ReSTIRPT PRIVATE
     ShiftMappings.slang
     SpatialReuse.cs.slang
     StaticParams.slang
+    TemporalReuse.cs.slang
     TracePass.rt.slang
 )
 

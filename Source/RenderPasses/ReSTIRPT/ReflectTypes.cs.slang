@@ -41,6 +41,7 @@ ParameterBlock<ReSTIRPT> ReSTIRPT;
 StructuredBuffer<ColorType> sampleColor;
 StructuredBuffer<GuideData> sampleGuideData;
 StructuredBuffer<PathReservoir> currentReservoirs;
+StructuredBuffer<PathReservoir> temporalReservoirs;
 StructuredBuffer<PathReservoir> spatialReservoirs;
 StructuredBuffer<PathReservoir> previousReservoirs;
 

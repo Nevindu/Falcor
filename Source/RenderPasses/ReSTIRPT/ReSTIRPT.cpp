@@ -36,6 +36,7 @@ namespace
     const std::string kGeneratePathsFilename = "RenderPasses/ReSTIRPT/GeneratePaths.cs.slang";
     const std::string kTracePassFilename = "RenderPasses/ReSTIRPT/TracePass.rt.slang";
     const std::string kResolvePassFilename = "RenderPasses/ReSTIRPT/ResolvePass.cs.slang";
+    const std::string kTemporalReuseFilename = "RenderPasses/ReSTIRPT/TemporalReuse.cs.slang";
     const std::string kSpatialReuseFilename = "RenderPasses/ReSTIRPT/SpatialReuse.cs.slang";
     const std::string kReflectTypesFile = "RenderPasses/ReSTIRPT/ReflectTypes.cs.slang";
 
@@ -106,6 +107,9 @@ namespace
     const std::string kFixedOutputSize = "fixedOutputSize";
     const std::string kColorFormat = "colorFormat";
     const std::string kDebugView = "debugView";
+    const std::string kUseTemporalReuse = "useTemporalReuse";
+    const std::string kTemporalHistoryLength = "temporalHistoryLength";
+    const std::string kTemporalReuseForceSamePixel = "temporalReuseForceSamePixel";
     const std::string kUseSpatialReuse = "useSpatialReuse";
     const std::string kSpatialNeighborCount = "spatialNeighborCount";
     const std::string kSpatialRadius = "spatialRadius";
@@ -126,15 +130,15 @@ namespace
         { 7u, "Target ratio" },
         { 8u, "Shift valid mask" },
         { 9u, "Shift rejection reason" },
-        { 10u, "Spatial accepted count" },
-        { 11u, "Spatial rejected count" },
-        { 12u, "Spatial combined M" },
-        { 13u, "Spatial source distance" },
-        { 14u, "Spatial rejection reason" },
-        { 15u, "Spatial shift mask" },
+        { 10u, "Reuse accepted count" },
+        { 11u, "Reuse rejected count" },
+        { 12u, "Reuse combined M" },
+        { 13u, "Reuse source distance" },
+        { 14u, "Reuse rejection reason" },
+        { 15u, "Reuse shift mask" },
         { 16u, "Replay mismatch mask" },
-        { 17u, "Spatial MIS weight sum" },
-        { 18u, "Spatial accepted fraction" },
+        { 17u, "Reuse MIS weight sum" },
+        { 18u, "Reuse accepted fraction" },
     };
 
     const Gui::DropdownList kShiftMappingList =
@@ -241,6 +245,17 @@ void ReSTIRPT::parseProperties(const Properties& props)
         else if (key == kFixedOutputSize) mFixedOutputSize = value;
         else if (key == kColorFormat) mStaticParams.colorFormat = value;
         else if (key == kDebugView) mDebugView = value;
+        else if (key == kUseTemporalReuse) mUseTemporalReuse = value;
+        else if (key == kTemporalHistoryLength) mTemporalHistoryLength = value;
+        else if (key == kTemporalReuseForceSamePixel)
+        {
+            const bool forceSamePixel = value;
+            if (mTemporalReuseForceSamePixel != forceSamePixel)
+            {
+                mTemporalReuseForceSamePixel = forceSamePixel;
+                reset();
+            }
+        }
         else if (key == kUseSpatialReuse) mUseSpatialReuse = value;
         else if (key == kSpatialNeighborCount) mSpatialNeighborCount = value;
         else if (key == kSpatialRadius) mSpatialRadius = value;
@@ -329,6 +344,7 @@ void ReSTIRPT::validateOptions()
     mSpatialNeighborCount = std::clamp(mSpatialNeighborCount, 0u, 32u);
     mSpatialRadius = std::clamp(mSpatialRadius, 1u, 128u);
     mSpatialIterations = std::clamp(mSpatialIterations, 1u, 1u);
+    mTemporalHistoryLength = std::clamp(mTemporalHistoryLength, 0u, 1024u);
     mParams.shiftMapping = std::min<uint32_t>(mParams.shiftMapping, uint32_t(ShiftMapping::Hybrid));
 }
 
@@ -377,6 +393,9 @@ Properties ReSTIRPT::getProperties() const
     if (mOutputSizeSelection == RenderPassHelpers::IOSize::Fixed) props[kFixedOutputSize] = mFixedOutputSize;
     props[kColorFormat] = mStaticParams.colorFormat;
     props[kDebugView] = mDebugView;
+    props[kUseTemporalReuse] = mUseTemporalReuse;
+    props[kTemporalHistoryLength] = mTemporalHistoryLength;
+    props[kTemporalReuseForceSamePixel] = mTemporalReuseForceSamePixel;
     props[kUseSpatialReuse] = mUseSpatialReuse;
     props[kSpatialNeighborCount] = mSpatialNeighborCount;
     props[kSpatialRadius] = mSpatialRadius;
@@ -468,13 +487,27 @@ void ReSTIRPT::execute(RenderContext* pRenderContext, const RenderData& renderDa
     FALCOR_ASSERT(mpTracePass);
     tracePass(pRenderContext, renderData, *mpTracePass);
 
+    const bool canRunTemporalReuse =
+        mUseTemporalReuse &&
+        mTemporalHistoryLength > 0 &&
+        mParams.frameCount > 0 &&
+        (mTemporalReuseForceSamePixel || renderData.getTexture(kInputMotionVectors) != nullptr) &&
+        (mTemporalReuseForceSamePixel || mParams.shiftMapping != uint32_t(ShiftMapping::Hybrid));
+    mTemporalReuseActive = canRunTemporalReuse;
+    if (mTemporalReuseActive)
+    {
+        temporalReusePass(pRenderContext, renderData);
+    }
+
+    ref<Buffer> pSpatialInputReservoirs = mTemporalReuseActive ? mpTemporalReservoirs : mpCurrentReservoirs;
+
     // The spatial skeleton writes the final color directly from the combined
     // reservoir. When disabled, keep the original PathTracerN-style resolve path.
     if (mUseSpatialReuse)
     {
-        spatialReusePass(pRenderContext, renderData);
+        spatialReusePass(pRenderContext, renderData, pSpatialInputReservoirs);
     }
-    else
+    else if (!mTemporalReuseActive)
     {
         // Resolve pass.
         resolvePass(pRenderContext, renderData);
@@ -601,6 +634,28 @@ bool ReSTIRPT::renderRenderingUI(Gui::Widgets& widget)
         }
     }
 
+    if (auto group = widget.group("Temporal reuse"))
+    {
+        runtimeDirty |= group.checkbox("Enable temporal reuse", mUseTemporalReuse);
+        group.tooltip("Reprojects the previous frame reservoir with motion vectors and shifts it into the current pixel. Currently enabled for Reconnection and Random replay; Hybrid waits for the later temporal retrace buffer.");
+
+        if (mUseTemporalReuse)
+        {
+            runtimeDirty |= group.var("History length", mTemporalHistoryLength, 0u, 1024u);
+            group.tooltip("Caps previous-frame reservoir confidence to this multiple of the current reservoir confidence. 0 disables previous-frame import.");
+            if (group.checkbox("Force same temporal pixel", mTemporalReuseForceSamePixel))
+            {
+                runtimeDirty = true;
+                reset();
+            }
+            group.tooltip("Debug mode: reuse the previous-frame reservoir from the same pixel and treat it as an identity-domain sample. This ignores motion vectors and bypasses the temporal shift map.");
+            if (!mUseSpatialReuse && !mTemporalReuseForceSamePixel)
+            {
+                runtimeDirty |= group.dropdown("Shift mapping", kShiftMappingList, mParams.shiftMapping);
+            }
+        }
+    }
+
     if (auto group = widget.group("Material controls"))
     {
         dirty |= widget.checkbox("Alpha test", mStaticParams.useAlphaTest);
@@ -698,6 +753,7 @@ bool ReSTIRPT::onMouseEvent(const MouseEvent& mouseEvent)
 void ReSTIRPT::reset()
 {
     mParams.frameCount = 0;
+    mTemporalReuseActive = false;
 }
 
 ReSTIRPT::TracePass::TracePass(ref<Device> pDevice, const std::string& name, const std::string& passDefine, const ref<Scene>& pScene, const DefineList& defines, const TypeConformanceList& globalTypeConformances)
@@ -781,6 +837,7 @@ void ReSTIRPT::resetPrograms()
 {
     mpTracePass = nullptr;
     mpGeneratePaths = nullptr;
+    mpTemporalReusePass = nullptr;
     mpSpatialReusePass = nullptr;
     mpReflectTypes = nullptr;
 
@@ -825,6 +882,12 @@ void ReSTIRPT::updatePrograms()
         desc.addShaderLibrary(kSpatialReuseFilename).csEntry("main");
         mpSpatialReusePass = ComputePass::create(mpDevice, desc, defines, false);
     }
+    if (!mpTemporalReusePass)
+    {
+        ProgramDesc desc = baseDesc;
+        desc.addShaderLibrary(kTemporalReuseFilename).csEntry("main");
+        mpTemporalReusePass = ComputePass::create(mpDevice, desc, defines, false);
+    }
     if (!mpReflectTypes)
     {
         ProgramDesc desc = baseDesc;
@@ -842,6 +905,7 @@ void ReSTIRPT::updatePrograms()
         pass->setVars(nullptr);
     };
     preparePass(mpGeneratePaths);
+    preparePass(mpTemporalReusePass);
     preparePass(mpSpatialReusePass);
     preparePass(mpResolvePass);
     preparePass(mpReflectTypes);
@@ -878,6 +942,7 @@ void ReSTIRPT::prepareResources(RenderContext* pRenderContext, const RenderData&
     }
 
     const uint32_t reservoirCount = mParams.frameDim.x * mParams.frameDim.y;
+    ref<Texture> pVBuffer = renderData.getTexture(kInputVBuffer);
 
     // Reservoir buffers are per-pixel, not per-candidate. The trace pass writes
     // the initial RIS reservoir, the optional spatial pass writes a combined
@@ -887,6 +952,13 @@ void ReSTIRPT::prepareResources(RenderContext* pRenderContext, const RenderData&
     {
         mpCurrentReservoirs = mpDevice->createStructuredBuffer(var["currentReservoirs"], reservoirCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
         pRenderContext->clearUAV(mpCurrentReservoirs->getUAV().get(), uint4(0));
+        mVarsChanged = true;
+    }
+
+    if (!mpTemporalReservoirs || mpTemporalReservoirs->getElementCount() < reservoirCount || mVarsChanged)
+    {
+        mpTemporalReservoirs = mpDevice->createStructuredBuffer(var["temporalReservoirs"], reservoirCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
+        pRenderContext->clearUAV(mpTemporalReservoirs->getUAV().get(), uint4(0));
         mVarsChanged = true;
     }
 
@@ -901,6 +973,24 @@ void ReSTIRPT::prepareResources(RenderContext* pRenderContext, const RenderData&
     {
         mpPreviousReservoirs = mpDevice->createStructuredBuffer(var["previousReservoirs"], reservoirCount, ResourceBindFlags::ShaderResource | ResourceBindFlags::UnorderedAccess, MemoryType::DeviceLocal, nullptr, false);
         pRenderContext->clearUAV(mpPreviousReservoirs->getUAV().get(), uint4(0));
+        mVarsChanged = true;
+    }
+
+    if (pVBuffer && (!mpPreviousVBuffer ||
+        mpPreviousVBuffer->getWidth() != pVBuffer->getWidth() ||
+        mpPreviousVBuffer->getHeight() != pVBuffer->getHeight() ||
+        mpPreviousVBuffer->getFormat() != pVBuffer->getFormat() ||
+        mVarsChanged))
+    {
+        mpPreviousVBuffer = mpDevice->createTexture2D(
+            pVBuffer->getWidth(),
+            pVBuffer->getHeight(),
+            pVBuffer->getFormat(),
+            1,
+            1,
+            nullptr,
+            ResourceBindFlags::ShaderResource
+        );
         mVarsChanged = true;
     }
 
@@ -1197,12 +1287,25 @@ void ReSTIRPT::endFrame(RenderContext* pRenderContext, const RenderData& renderD
     if (mpCurrentReservoirs && mpPreviousReservoirs)
     {
         // Store the reservoir that actually produced this frame. Spatial reuse
-        // becomes the final reservoir when enabled; otherwise the traced initial
-        // reservoir is the final result.
-        pRenderContext->copyResource(mpPreviousReservoirs.get(), mUseSpatialReuse && mpSpatialReservoirs ? mpSpatialReservoirs.get() : mpCurrentReservoirs.get());
+        // becomes final when enabled; otherwise temporal reuse is final if it ran.
+        Buffer* pFinalReservoirs = mpCurrentReservoirs.get();
+        if (mUseSpatialReuse && mpSpatialReservoirs)
+        {
+            pFinalReservoirs = mpSpatialReservoirs.get();
+        }
+        else if (mTemporalReuseActive && mpTemporalReservoirs)
+        {
+            pFinalReservoirs = mpTemporalReservoirs.get();
+        }
+        pRenderContext->copyResource(mpPreviousReservoirs.get(), pFinalReservoirs);
+    }
+    if (mpPreviousVBuffer && renderData.getTexture(kInputVBuffer))
+    {
+        pRenderContext->copyResource(mpPreviousVBuffer.get(), renderData.getTexture(kInputVBuffer).get());
     }
 
     mVarsChanged = false;
+    mTemporalReuseActive = false;
     mParams.frameCount++;
 }
 
@@ -1257,7 +1360,38 @@ void ReSTIRPT::tracePass(RenderContext* pRenderContext, const RenderData& render
     mpScene->raytrace(pRenderContext, tracePass.pProgram.get(), tracePass.pVars, uint3(mParams.frameDim, 1));
 }
 
-void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData)
+void ReSTIRPT::temporalReusePass(RenderContext* pRenderContext, const RenderData& renderData)
+{
+    FALCOR_PROFILE(pRenderContext, "temporalReusePass");
+
+    FALCOR_ASSERT(mpTemporalReusePass);
+
+    mpTemporalReusePass->addDefine("USE_VIEW_DIR", (mpScene->getCamera()->getApertureRadius() > 0 && renderData[kInputViewDir] != nullptr) ? "1" : "0");
+
+    // Temporal reuse shifts the previous frame's final reservoir into the
+    // current pixel domain and writes a combined reservoir/color. The same-pixel
+    // debug path bypasses the temporal shift map entirely.
+    auto var = mpTemporalReusePass->getRootVar()["CB"]["gTemporalReusePass"];
+    var["params"].setBlob(mParams);
+    var["currentReservoirs"] = mpCurrentReservoirs;
+    var["previousReservoirs"] = mpPreviousReservoirs;
+    var["outputReservoirs"] = mpTemporalReservoirs;
+    var["outputColor"] = renderData.getTexture(kOutputColor);
+    var["vbuffer"] = renderData.getTexture(kInputVBuffer);
+    var["previousVBuffer"] = mpPreviousVBuffer;
+    var["viewDir"] = renderData.getTexture(kInputViewDir);
+    var["motionVectors"] = renderData.getTexture(kInputMotionVectors);
+    var["historyLength"] = mTemporalHistoryLength;
+    var["debugView"] = mDebugView;
+    var["featureBasedRejection"] = mFeatureBasedRejection ? 1u : 0u;
+    var["forceSamePixel"] = mTemporalReuseForceSamePixel ? 1u : 0u;
+
+    mpTemporalReusePass->getRootVar()["gReSTIRPT"] = mpReSTIRPTBlock;
+    mpScene->bindShaderData(mpTemporalReusePass->getRootVar()["gScene"]);
+    mpTemporalReusePass->execute(pRenderContext, { mParams.frameDim, 1u });
+}
+
+void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData, const ref<Buffer>& pInputReservoirs)
 {
     FALCOR_PROFILE(pRenderContext, "spatialReusePass");
 
@@ -1271,7 +1405,7 @@ void ReSTIRPT::spatialReusePass(RenderContext* pRenderContext, const RenderData&
     // env/emissive PDFs using the same samplers as the initial NEE pass.
     auto var = mpSpatialReusePass->getRootVar()["CB"]["gSpatialReusePass"];
     var["params"].setBlob(mParams);
-    var["inputReservoirs"] = mpCurrentReservoirs;
+    var["inputReservoirs"] = pInputReservoirs ? pInputReservoirs : mpCurrentReservoirs;
     var["outputReservoirs"] = mpSpatialReservoirs;
     var["outputColor"] = renderData.getTexture(kOutputColor);
     var["vbuffer"] = renderData.getTexture(kInputVBuffer);

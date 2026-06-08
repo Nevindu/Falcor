@@ -105,7 +105,8 @@ private:
     void endFrame(RenderContext* pRenderContext, const RenderData& renderData);
     void generatePaths(RenderContext* pRenderContext, const RenderData& renderData);
     void tracePass(RenderContext* pRenderContext, const RenderData& renderData, TracePass& tracePass);
-    void spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData);
+    void temporalReusePass(RenderContext* pRenderContext, const RenderData& renderData);
+    void spatialReusePass(RenderContext* pRenderContext, const RenderData& renderData, const ref<Buffer>& pInputReservoirs);
     void resolvePass(RenderContext* pRenderContext, const RenderData& renderData);
 
     /** Static configuration. Changing any of these options require shader recompilation.
@@ -172,6 +173,10 @@ private:
     bool                            mGBufferAdjustShadingNormals = false; ///< True if GBuffer/VBuffer has adjusted shading normals enabled.
     bool                            mOutputGuideData = false;   ///< True if guide data should be generated as outputs.
     uint32_t                        mDebugView = 0;             ///< Debug output view for reservoir diagnostics.
+    bool                            mUseTemporalReuse = false;  ///< Enable temporal reservoir reuse.
+    uint32_t                        mTemporalHistoryLength = 20; ///< Maximum previous-frame confidence multiplier used by temporal reuse.
+    bool                            mTemporalReuseForceSamePixel = false; ///< Debug mode: reuse the previous reservoir from the same pixel without reprojection or shift mapping.
+    bool                            mTemporalReuseActive = false; ///< True if temporal reuse ran this frame.
     bool                            mUseSpatialReuse = false;   ///< Enable spatial neighbor reuse skeleton.
     uint32_t                        mSpatialNeighborCount = 3;  ///< Number of spatial neighbors to test.
     uint32_t                        mSpatialRadius = 20;        ///< Spatial neighbor radius in pixels.
@@ -180,6 +185,7 @@ private:
     bool                            mFeatureBasedRejection = false; ///< Reject geometrically dissimilar spatial neighbors. Default off: the denominator check in evaluateCandidateAtPixel currently compares source-vs-domain, not center-vs-domain, so enabling it can break the MIS partition of unity. Make consistent before enabling.
 
     ref<ComputePass>                mpGeneratePaths;            ///< Fullscreen compute pass generating paths starting at primary hits.
+    ref<ComputePass>                mpTemporalReusePass;        ///< Temporal reservoir reuse pass.
     ref<ComputePass>                mpSpatialReusePass;         ///< Spatial reservoir reuse pass.
     ref<ComputePass>                mpResolvePass;              ///< Sample resolve pass.
     ref<ComputePass>                mpReflectTypes;             ///< Helper for reflecting structured buffer types.
@@ -189,6 +195,8 @@ private:
     ref<Buffer>                     mpSampleColor;              ///< Compact per-sample color buffer. This is used only if spp > 1.
     ref<Buffer>                     mpSampleGuideData;          ///< Compact per-sample guide data.
     ref<Buffer>                     mpCurrentReservoirs;        ///< Current-frame ReSTIR PT reservoirs, one per pixel.
+    ref<Buffer>                     mpTemporalReservoirs;       ///< Temporal reuse output reservoirs, one per pixel.
     ref<Buffer>                     mpSpatialReservoirs;        ///< Spatial reuse output reservoirs, one per pixel.
     ref<Buffer>                     mpPreviousReservoirs;       ///< Previous-frame ReSTIR PT reservoirs, one per pixel.
+    ref<Texture>                    mpPreviousVBuffer;          ///< Previous-frame V-buffer for temporal MIS reverse-domain checks.
 };
