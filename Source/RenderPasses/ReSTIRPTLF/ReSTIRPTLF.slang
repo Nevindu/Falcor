@@ -40,6 +40,7 @@ import Utils.Debug.PixelDebug;
 import Utils.Sampling.TinyUniformSampleGenerator;
 import LoadShadingData;
 import ColorType;
+import LightField;
 __exported import PathState;
 __exported import Params;
 
@@ -60,9 +61,9 @@ interface IVisibilityQuery
     This implements the high-level path tracing logic and is shared among
     different scheduling implementations.
 */
-struct ReSTIRPT
+struct ReSTIRPTLF
 {
-    ReSTIRPTParams params;                        ///< Runtime parameters.
+    ReSTIRPTLFParams params;                        ///< Runtime parameters.
 
     // Samplers
     EnvMapSampler envMapSampler;                    ///< Environment map sampler. Only valid when kUseEnvLight == true.
@@ -95,7 +96,7 @@ struct ReSTIRPT
 
     // Additional specialization.
     static const bool kOutputGuideData = OUTPUT_GUIDE_DATA;
-    static const uint kDebugView = RESTIRPT_DEBUG_VIEW;
+    static const uint kDebugView = RESTIRPTLF_DEBUG_VIEW;
 
     /** Types of samplable lights.
     */
@@ -289,8 +290,8 @@ struct ReSTIRPT
         const uint2 pixel = path.getPixel();
 
         // Create primary ray.
-        Ray cameraRay = gScene.camera.computeRayPinhole(pixel, params.frameDim);
-        if (kUseViewDir) cameraRay.dir = -viewDir[pixel];
+        Ray cameraRay = computeLightFieldRay(params, pixel);
+        if (params.lfEnabled == 0u && kUseViewDir) cameraRay.dir = -viewDir[pixel];
         path.origin = cameraRay.origin;
         path.dir = cameraRay.dir;
 
@@ -300,7 +301,8 @@ struct ReSTIRPT
         path.selectedKind = kPathSampleKindInvalid;
 
         // Load the primary hit info from the V-buffer.
-        const HitInfo hit = unpackHitInfo(vbuffer[pixel]);
+        HitInfo hit = {};
+        if (isLightFieldPixelActive(params, pixel)) hit = unpackHitInfo(vbuffer[pixel]);
 
         // If invalid, the path is still active and treated as a miss.
         if (hit.isValid())
@@ -450,51 +452,6 @@ struct ReSTIRPT
             path.reconnectVertex = 2u;
     }
 
-    /** Simple no-lobe hybrid support predicate for a finite surface vertex.
-
-        Random replay may pass through arbitrary glossy/delta prefix vertices.
-        The local reconnection edge, however, needs rough non-delta reflection
-        support at both endpoints. This intentionally ignores sampled lobe tags;
-        it is the first hybrid stage before the lobe-index mapping is added.
-    */
-    bool isSimpleHybridReconnectibleSurface(
-        const PathState path,
-        const BSDFProperties bsdfProperties,
-        const uint lobeTypes,
-        const bool isTriangleHit,
-        const bool isCurveHit)
-    {
-        if (!isTriangleHit || isCurveHit) return false;
-        if (!path.interiorList.isEmpty() || path.isInsideDielectricVolume()) return false;
-        if (bsdfProperties.roughness <= params.specularRoughnessThreshold) return false;
-        return (lobeTypes & (uint)LobeType::NonDeltaReflection) != 0u;
-    }
-
-    /** Choose the earliest simple hybrid reconnect vertex k.
-
-        A valid k is the first rough finite pair x{k-1}->x{k}. Prefix vertices
-        before x{k-1} are replayed in primary-sample space and may be glossy or
-        delta; only the pair used for reconnection is constrained here.
-    */
-    void updateSimpleHybridReconnectVertex(
-        inout PathState path,
-        const ShadingData sd,
-        const BSDFProperties bsdfProperties,
-        const uint lobeTypes,
-        const bool isTriangleHit,
-        const bool isCurveHit)
-    {
-        const bool currentConnectible = isSimpleHybridReconnectibleSurface(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
-        if (path.reconnectVertex == kInvalidReconnectVertex && path.getVertexIndex() >= 2u && path.isSimpleHybridPrevConnectible() && currentConnectible)
-        {
-            const float edgeDistance = distance(sd.posW, path.origin);
-            if (edgeDistance >= params.minReconnectDistance)
-                path.reconnectVertex = path.getVertexIndex();
-        }
-
-        path.setSimpleHybridPrevConnectible(currentConnectible);
-    }
-
     void addPathContributionCandidate(
         inout PathState path,
         const float3 radiance,
@@ -636,8 +593,8 @@ struct ReSTIRPT
         const HitInfo hit = unpackHitInfo(vbuffer[pixel]);
         if (!hit.isValid()) return false;
 
-        Ray cameraRay = gScene.camera.computeRayPinhole(pixel, params.frameDim);
-        if (kUseViewDir) cameraRay.dir = -viewDir[pixel];
+        Ray cameraRay = computeLightFieldRay(params, pixel);
+        if (params.lfEnabled == 0u && kUseViewDir) cameraRay.dir = -viewDir[pixel];
 
         ShadingData sd = loadShadingData(hit, cameraRay.origin, cameraRay.dir);
         uint loadedMaterialID = 0u;
@@ -683,14 +640,7 @@ struct ReSTIRPT
         {
             sample.flags |= kPathSampleFlagNeedsReplay;
         }
-        const bool selectedKindHybridSupported =
-            path.selectedKind == kPathSampleKindNEE ||
-            path.selectedKind == kPathSampleKindHitLight ||
-            path.selectedKind == kPathSampleKindEnv;
-        if (path.reconnectVertex > 2u && path.reconnectVertex <= kMaxStoredReplayLobes && selectedKindHybridSupported && path.selectedVertex >= path.reconnectVertex)
-        {
-            sample.flags |= kPathSampleFlagNeedsHybridReplay;
-        }
+        // Hybrid replay is disabled in this LF pass for now.
         // Single-bounce direct NEE (light sampled straight from the primary surface) is the dominant
         // lighting signal but has no x2/replay reconnection target. Mark it for the dedicated direct-NEE
         // reconnection shift, which reuses the same light sample at the destination primary surface. The
@@ -1386,10 +1336,7 @@ struct ReSTIRPT
 
         const uint lobeTypes = mi.getLobeTypes(sd);
         const bool hasNonDeltaLobes = (lobeTypes & (uint)LobeType::NonDelta) != 0;
-        if (ShiftMapping(params.shiftMapping) == ShiftMapping::Hybrid)
-            updateSimpleHybridReconnectVertex(path, sd, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
-        else
-            updateFixedX2ReconnectVertex(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
+        updateFixedX2ReconnectVertex(path, bsdfProperties, lobeTypes, isTriangleHit, isCurveHit);
 
         // Check if the scatter event is samplable by the light sampling technique.
         const bool isLightSamplable = path.isLightSamplable();

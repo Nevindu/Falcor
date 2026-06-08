@@ -41,7 +41,6 @@ static const uint kPathSampleFlagCanReconnectAtX2 = 1u << 1;  ///< Sample can be
 static const uint kPathSampleFlagNeedsReplay = 1u << 2;       ///< Sample requires source path replay/tail evaluation before the fixed-x2 reconnection shift.
 static const uint kPathSampleFlagAlreadyShifted = 1u << 3;    ///< Sample has already been shifted into another primary domain; replayed suffix imports must not replay it as canonical.
 static const uint kPathSampleFlagCanReconnectDirectNEE = 1u << 4; ///< Single-bounce direct NEE at the primary vertex: shiftable by reconnecting the same light sample to the destination primary surface.
-static const uint kPathSampleFlagNeedsHybridReplay = 1u << 5; ///< Sample uses simple hybrid replay to reach y{k-1}, then reconnects to x_k.
 
 static const uint kPathSampleKindInvalid = 0u;
 static const uint kPathSampleKindHitLight = 1u;               ///< BSDF-sampled hit on an emissive surface.
@@ -143,7 +142,6 @@ enum class PathFlags
     deltaOnlyPath               = 0x1000,   ///< There was no non-delta events along the path so far.
 
     primaryRoughHit             = 0x2000,   ///< Primary surface is rough (roughness > specularRoughnessThreshold). Used to gate the direct-NEE reconnection shift symmetrically.
-    simpleHybridPrevConnectible = 0x4000,   ///< Previous path vertex was a rough finite surface accepted by the simple no-lobe hybrid connectibility predicate.
 
     // Bits 15 to kPathFlagsBitCount are still unused.
 };
@@ -232,7 +230,6 @@ struct PathState
     bool isDeltaTransmissionPath() { return hasFlag(PathFlags::deltaTransmissionPath); }
     bool isDeltaOnlyPath() { return hasFlag(PathFlags::deltaOnlyPath); }
     bool isPrimaryRough() { return hasFlag(PathFlags::primaryRoughHit); }
-    bool isSimpleHybridPrevConnectible() { return hasFlag(PathFlags::simpleHybridPrevConnectible); }
 
     // Check if the scatter event is samplable by the light sampling technique.
     bool isLightSamplable() { return !isDelta(); }
@@ -259,7 +256,6 @@ struct PathState
     [mutating] void setDeltaTransmissionPath(bool value = true) { setFlag(PathFlags::deltaTransmissionPath, value); }
     [mutating] void setDeltaOnlyPath(bool value = true) { setFlag(PathFlags::deltaOnlyPath, value); }
     [mutating] void setPrimaryRoughHit(bool value = true) { setFlag(PathFlags::primaryRoughHit, value); }
-    [mutating] void setSimpleHybridPrevConnectible(bool value = true) { setFlag(PathFlags::simpleHybridPrevConnectible, value); }
 
     bool hasFlag(PathFlags flag)
     {

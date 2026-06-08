@@ -1,0 +1,167 @@
+/***************************************************************************
+ # Copyright (c) 2015-23, NVIDIA CORPORATION. All rights reserved.
+ #
+ # Redistribution and use in source and binary forms, with or without
+ # modification, are permitted provided that the following conditions
+ # are met:
+ #  * Redistributions of source code must retain the above copyright
+ #    notice, this list of conditions and the following disclaimer.
+ #  * Redistributions in binary form must reproduce the above copyright
+ #    notice, this list of conditions and the following disclaimer in the
+ #    documentation and/or other materials provided with the distribution.
+ #  * Neither the name of NVIDIA CORPORATION nor the names of its
+ #    contributors may be used to endorse or promote products derived
+ #    from this software without specific prior written permission.
+ #
+ # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS "AS IS" AND ANY
+ # EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ # IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ # PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+ # CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+ # EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ # PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+ # PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+ # OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ **************************************************************************/
+#pragma once
+#include "Utils/HostDeviceShared.slangh"
+
+BEGIN_NAMESPACE_FALCOR
+
+/** Per-sample color format.
+*/
+enum class ColorFormat : uint32_t
+{
+    RGBA32F         = 0,
+    LogLuvHDR       = 1,
+};
+
+FALCOR_ENUM_INFO(ColorFormat, {
+    { ColorFormat::RGBA32F, "RGBA32F" },
+    { ColorFormat::LogLuvHDR, "LogLuvHDR" },
+});
+FALCOR_ENUM_REGISTER(ColorFormat);
+
+enum class MISHeuristic : uint32_t
+{
+    Balance     = 0,    ///< Balance heuristic.
+    PowerTwo    = 1,    ///< Power heuristic (exponent = 2.0).
+    PowerExp    = 2,    ///< Power heuristic (variable exponent).
+};
+
+FALCOR_ENUM_INFO(MISHeuristic, {
+    { MISHeuristic::Balance, "Balance" },
+    { MISHeuristic::PowerTwo, "PowerTwo" },
+    { MISHeuristic::PowerExp, "PowerExp" },
+});
+FALCOR_ENUM_REGISTER(MISHeuristic);
+
+enum class SpatialMISStrategy : uint32_t
+{
+    Constant    = 0,    ///< Baseline reservoir merge using constant reuse MIS.
+    Generalized = 1,    ///< Generalized balance heuristic over accepted spatial proposal domains.
+    Pairwise    = 2,    ///< Pairwise MIS between the canonical proposal and each neighbor proposal.
+};
+
+FALCOR_ENUM_INFO(SpatialMISStrategy, {
+    { SpatialMISStrategy::Constant, "Constant" },
+    { SpatialMISStrategy::Generalized, "Generalized" },
+    { SpatialMISStrategy::Pairwise, "Pairwise" },
+});
+FALCOR_ENUM_REGISTER(SpatialMISStrategy);
+
+enum class ShiftMapping : uint32_t
+{
+    Reconnection = 0,  ///< Fixed-x2 reconnection shift.
+    RandomReplay = 1,  ///< Random replay shift scaffold. Currently falls back to identity.
+};
+
+FALCOR_ENUM_INFO(ShiftMapping, {
+    { ShiftMapping::Reconnection, "Reconnection" },
+    { ShiftMapping::RandomReplay, "Random replay" },
+});
+FALCOR_ENUM_REGISTER(ShiftMapping);
+
+// Define tile sizes in pixels.
+// The frame is divided into tiles stored in scanline order, with pixels in tiles enumerated in Morton order.
+static const uint2 kScreenTileDim = { 16, 16 };     ///< Screen-tile dimension in pixels.
+static const uint2 kScreenTileBits = { 4, 4 };      ///< Bits needed to describe pixel position within a screen-tile.
+
+// Define path configuration limits.
+static const uint kMaxSamplesPerPixel = 16;         ///< Maximum supported sample count. We can use tiling to support large sample counts if needed.
+static const uint kMaxFrameDimension = 4096;        ///< Maximum supported frame dimension in pixels along x or y. We can increase the bit allocation if needed.
+static const uint kMaxBounces = 254;                ///< Maximum supported number of bounces per bounce category (value 255 is reserved for internal use). The resulting path length may be longer than this.
+static const uint kMaxLightSamplesPerVertex = 8;    ///< Maximum number of shadow rays per path vertex for next-event estimation.
+
+// Import static specialization constants.
+#ifndef HOST_CODE
+__exported import StaticParams;
+__exported import Utils.Math.BitTricks;
+#endif
+
+/** Path tracer parameters shared between host/device code.
+*/
+struct ReSTIRPTLFParams
+{
+    int     useFixedSeed = false;       ///< Use fixed random seed. This is useful for debugging.
+    uint    fixedSeed = 1;              ///< The seed to use when 'useFixedSeed' is enabled.
+    float   lodBias = 0.f;              ///< LOD bias applied to secondary hits.
+    float   specularRoughnessThreshold = 0.25f; ///< Specular reflection events are only classified as specular if the material's roughness value is equal or smaller than this threshold. Otherwise they are classified diffuse.
+    float   minReconnectDistance = 1e-3f; ///< Minimum distance for path-space reconnection. Shorter shifts are rejected.
+    float   maxReconnectJacobian = 1e4f; ///< Maximum accepted reconnection Jacobian. Larger values are rejected, not clamped.
+    uint    shiftMapping = uint(ShiftMapping::Reconnection); ///< Runtime-selected shift mapping for spatial/future temporal reuse.
+    uint    _padShiftMapping = 0;
+
+    // Runtime values
+    uint2   frameDim = { 0, 0 };        ///< Frame dimension in pixels. In light-field mode this is the full quilt dimension.
+    uint2   screenTiles = { 0, 0 };     ///< Number of screen-tiles. Screen tiles may extend outside the frame.
+
+    // Light-field / quilt mode. The camera translates horizontally by view index,
+    // while quilt rows are storage layout only.
+    uint    lfEnabled = 1;
+    uint    lfViewCount = 9;
+    uint    lfViewsPerRow = 9;
+    uint    lfAngularNeighborRadius = 1;
+
+    uint2   lfViewDim = { 256, 256 };   ///< Single-view dimensions. If zero, inferred from frameDim/view layout.
+    float   lfViewSpacing = 0.04f;      ///< World-space distance between adjacent horizontal views.
+    float   lfFocalDistance = 4.f;      ///< Zero-disparity plane distance from the center camera.
+    float   lfMaxReprojectionErrorPx = 1.5f;
+    float   lfNormalThreshold = 0.9f;
+    float   lfDepthRelThreshold = 0.01f;
+
+    uint    frameCount = 0;             ///< Frames rendered. This is used as random seed.
+    uint    seed = 0;                   ///< Random seed. This will get updated from the host depending on settings.
+    uint2   _pad0;
+
+#ifndef HOST_CODE
+    /** Computes the offset into the tiled sample buffer for a given tile.
+        The samples for all pixels are stored consecutively after this offset.
+        \param[in] tile Tile coordinates.
+        \return Offset into tiled sample buffer.
+    */
+    uint getTileOffset(const uint2 tile)
+    {
+        uint stride = kScreenTileDim.x * kScreenTileDim.y * kSamplesPerPixel;
+        uint tileIdx = tile.y * screenTiles.x + tile.x;
+        return tileIdx * stride;
+    }
+
+    /** Computes the offset into the tiled sample buffer for a given pixel.
+        \param[in] pixel Pixel on screen.
+        \return Offset into tiled sample buffer.
+    */
+    uint getSampleOffset(const uint2 pixel)
+    {
+        uint2 tileID = pixel >> kScreenTileBits;
+        uint tileOffset = getTileOffset(tileID);
+        uint tileBits = kScreenTileBits.x + kScreenTileBits.y;
+        uint pixelIdx = interleave_16bit(pixel) & ((1 << tileBits) - 1); // TODO: Use interleave_8bit() if kScreenTileBits <= 4.
+        return tileOffset + pixelIdx * kSamplesPerPixel;
+    }
+#endif
+};
+
+END_NAMESPACE_FALCOR
